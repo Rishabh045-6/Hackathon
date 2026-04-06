@@ -90,6 +90,7 @@ async function readApiResponse<T>(response: Response): Promise<ApiResponse<T>> {
 const CONFIDENCE_THRESHOLD = 0.9;
 const INITIAL_SIMULATION_CLASS = "Pure_Sinusoidal";
 const EXPLANATION_MIN_REQUEST_GAP_MS = 15_000;
+const SOURCE_CLASS_REVEAL_REMAINING_MS = 2_000;
 
 function computeSignalMetrics(values: number[]) {
   if (values.length === 0) {
@@ -292,6 +293,13 @@ export function WaveformClassifierCard() {
   const streamRemainingMs = liveStreamState
     ? Math.max(0, liveStreamState.duration_ms - liveElapsedMs)
     : 0;
+  const shouldRevealSourceClass =
+    liveStreamState
+      ? streamRemainingMs <= SOURCE_CLASS_REVEAL_REMAINING_MS
+      : signal
+        ? processedSamples >= Math.max(signal.length - 2, 1)
+        : false;
+  const sourceClassDisplay = shouldRevealSourceClass ? (liveSourceClass ?? "--") : "Classifying...";
   const liveMetrics = useMemo(
     () => computeSignalMetrics((signal ?? []).slice(0, processedSamples)),
     [signal, processedSamples],
@@ -778,7 +786,7 @@ export function WaveformClassifierCard() {
               <span>{signal ? "100-point waveform loaded" : "Waiting for waveform sample"}</span>
               <span>mode: shared realtime stream</span>
               {liveStreamState ? <span>phase: {liveStreamState.phase}</span> : null}
-              {liveSourceClass ? <span>source: {liveSourceClass}</span> : null}
+              {liveSourceClass ? <span>source: {sourceClassDisplay}</span> : null}
               {liveStreamState ? <span>duration: {liveStreamState.duration_ms} ms</span> : null}
               {selectedFile ? <span>manual file: {selectedFile}</span> : null}
             </div>
@@ -840,7 +848,7 @@ export function WaveformClassifierCard() {
                     <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
                       <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
                         <p className="text-xs font-medium text-slate-500">Source class</p>
-                        <p className="mt-2 text-sm font-semibold text-white">{liveSourceClass ?? "--"}</p>
+                        <p className="mt-2 text-sm font-semibold text-white">{sourceClassDisplay}</p>
                       </div>
                       <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
                         <p className="text-xs font-medium text-slate-500">Current sample</p>
