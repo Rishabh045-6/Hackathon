@@ -5,12 +5,14 @@ import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { BarChartCard } from "@/components/charts/bar-chart-card";
 import { LineChartCard } from "@/components/charts/line-chart-card";
 import { PanelCard } from "@/components/dashboard/panel-card";
+import { createClient as createSupabaseClient } from "@/lib/supabase/client";
 import {
   buildFallbackOperationalExplanation,
   getClassifierExplanation,
   type ExplanationRequestPayload,
   type OperationalExplanation,
 } from "@/lib/classifier-explanations";
+import type { LiveStreamState } from "@/types/grid";
 
 type ClassifierResponse = {
   predicted_class: string;
@@ -27,6 +29,11 @@ type ApiResponse<T> = {
   ok: boolean;
   data: T;
   error: string | null;
+  meta?: {
+    advanced?: boolean;
+    expired?: boolean;
+    expires_at?: string | null;
+  } | null;
 };
 
 type DatasetMeta = {
@@ -41,9 +48,6 @@ type WaveformSample = {
   totalSamples: number;
   signal: number[];
 };
-
-type SimulationMode = "single" | "all";
-type LiveStreamPhase = "normal" | "disturbance";
 
 type SimulationHistoryEntry = {
   run: number;
@@ -60,8 +64,29 @@ type SimulationHistoryEntry = {
   explanation: OperationalExplanation;
 };
 
+async function readApiResponse<T>(response: Response): Promise<ApiResponse<T>> {
+  const text = await response.text();
+
+  if (!text.trim()) {
+    return {
+      ok: false,
+      data: null as T,
+      error: "The server returned an empty response.",
+    };
+  }
+
+  try {
+    return JSON.parse(text) as ApiResponse<T>;
+  } catch {
+    return {
+      ok: false,
+      data: null as T,
+      error: "The server returned an invalid JSON response.",
+    };
+  }
+}
+
 const CONFIDENCE_THRESHOLD = 0.9;
-const LIVE_STREAM_INTERVAL_MS = 7_000;
 const INITIAL_SIMULATION_CLASS = "Pure_Sinusoidal";
 const EXPLANATION_MIN_REQUEST_GAP_MS = 15_000;
 
@@ -137,24 +162,16 @@ function parseSignalInput(raw: string): number[] {
   return values;
 }
 
-function getNormalClass(classes: string[]) {
-  return classes.includes(INITIAL_SIMULATION_CLASS) ? INITIAL_SIMULATION_CLASS : (classes[0] ?? "");
-}
-
 export function WaveformClassifierCard() {
   const [inputValue, setInputValue] = useState("");
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [signal, setSignal] = useState<number[] | null>(null);
   const [result, setResult] = useState<ClassifierResponse | null>(null);
   const [datasetMeta, setDatasetMeta] = useState<DatasetMeta | null>(null);
-  const [simulationMode, setSimulationMode] = useState<SimulationMode>("all");
-  const [selectedClass, setSelectedClass] = useState("");
-  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [liveStreamState, setLiveStreamState] = useState<LiveStreamState | null>(null);
   const [simulationInfo, setSimulationInfo] = useState<WaveformSample | null>(null);
   const [history, setHistory] = useState<SimulationHistoryEntry[]>([]);
   const [expandedRuns, setExpandedRuns] = useState<number[]>([]);
-  const [autoplay, setAutoplay] = useState(true);
-  const [liveStreamPhase, setLiveStreamPhase] = useState<LiveStreamPhase>("disturbance");
   const [liveSourceClass, setLiveSourceClass] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confidenceGateMessage, setConfidenceGateMessage] = useState<string | null>(null);
@@ -163,6 +180,7 @@ export function WaveformClassifierCard() {
   const [manualModeOpen, setManualModeOpen] = useState(false);
   const [explanation, setExplanation] = useState<OperationalExplanation | null>(null);
   const [playbackIndex, setPlaybackIndex] = useState(0);
+  const [streamNowMs, setStreamNowMs] = useState(() => Date.now());
   const lastExplanationMetaRef = useRef<{
     key: string;
     source: "llm" | "fallback";
@@ -171,7 +189,7 @@ export function WaveformClassifierCard() {
   } | null>(null);
   const lastExplanationRequestRef = useRef<{ key: string; at: number } | null>(null);
   const explanationRequestInFlightRef = useRef<string | null>(null);
-  const liveStreamPhaseRef = useRef<LiveStreamPhase>("disturbance");
+  const lastSharedEventKeyRef = useRef<string | null>(null);
 
   const severityStyle = useMemo(
     () => getSeverityStyle(result?.predicted_label ?? null),
@@ -199,10 +217,6 @@ export function WaveformClassifierCard() {
       return points;
     });
   }, [history]);
-  const liveWaveformPreview = useMemo(
-    () => waveformPreview.slice(0, playbackIndex + 1),
-    [waveformPreview, playbackIndex],
-  );
 
   const topProbabilityData = useMemo(
     () =>
@@ -247,9 +261,29 @@ export function WaveformClassifierCard() {
       averageConfidence: Number((averageConfidence * 100).toFixed(2)),
     };
   }, [history]);
-  const currentSampleValue = signal?.[playbackIndex] ?? null;
-  const processedSamples = signal ? Math.min(playbackIndex + 1, signal.length) : 0;
-  const playbackProgress = signal?.length ? (processedSamples / signal.length) * 100 : 0;
+  const liveElapsedMs = liveStreamState
+    ? Math.max(0, streamNowMs - new Date(liveStreamState.started_at).getTime())
+    : 0;
+  const sharedProgressRatio = liveStreamState
+    ? clamp(liveElapsedMs / liveStreamState.duration_ms, 0, 1)
+    : 0;
+  const effectivePlaybackIndex =
+    liveStreamState && signal?.length
+      ? Math.min(signal.length - 1, Math.floor(sharedProgressRatio * Math.max(signal.length - 1, 0)))
+      : playbackIndex;
+  const liveWaveformPreview = useMemo(
+    () => waveformPreview.slice(0, effectivePlaybackIndex + 1),
+    [effectivePlaybackIndex, waveformPreview],
+  );
+  const currentSampleValue = signal?.[effectivePlaybackIndex] ?? null;
+  const processedSamples = signal ? Math.min(effectivePlaybackIndex + 1, signal.length) : 0;
+  const playbackProgress =
+    liveStreamState && signal?.length
+      ? Number((sharedProgressRatio * 100).toFixed(2))
+      : (signal?.length ? (processedSamples / signal.length) * 100 : 0);
+  const streamRemainingMs = liveStreamState
+    ? Math.max(0, liveStreamState.duration_ms - liveElapsedMs)
+    : 0;
   const liveMetrics = useMemo(
     () => computeSignalMetrics((signal ?? []).slice(0, processedSamples)),
     [signal, processedSamples],
@@ -275,17 +309,12 @@ export function WaveformClassifierCard() {
     async function loadDatasetMeta() {
       try {
         const response = await fetch("/api/grid/waveform", { cache: "no-store" });
-        const json = (await response.json()) as ApiResponse<DatasetMeta | null>;
+        const json = await readApiResponse<DatasetMeta | null>(response);
         if (!json.ok || !json.data) {
           throw new Error(json.error ?? "Failed to load waveform dataset.");
         }
 
         setDatasetMeta(json.data);
-        setSelectedClass(
-          json.data.classes.includes(INITIAL_SIMULATION_CLASS)
-            ? INITIAL_SIMULATION_CLASS
-            : (json.data.classes[0] ?? ""),
-        );
       } catch (metaError) {
         setError(metaError instanceof Error ? metaError.message : "Failed to load waveform dataset.");
       }
@@ -295,33 +324,106 @@ export function WaveformClassifierCard() {
   }, []);
 
   useEffect(() => {
-    if (simulationMode !== "all" || !datasetMeta) {
-      return;
+    let cancelled = false;
+    const supabase = createSupabaseClient();
+
+    async function loadCurrentLiveStream() {
+      try {
+        const response = await fetch("/api/grid/live-stream", { cache: "no-store" });
+        const json = await readApiResponse<LiveStreamState | null>(response);
+        if (!response.ok || !json.ok || !json.data) {
+          throw new Error(json.error ?? "Failed to load live stream state.");
+        }
+
+        if (!cancelled) {
+          setLiveStreamState(json.data);
+          setLiveSourceClass(json.data.class_name);
+        }
+      } catch (streamError) {
+        if (!cancelled) {
+          setError(streamError instanceof Error ? streamError.message : "Failed to load live stream state.");
+        }
+      }
     }
 
-    const initialClass = getNormalClass(datasetMeta.classes);
+    void loadCurrentLiveStream();
 
-    if (!initialClass) {
-      return;
-    }
+    const channel = supabase
+      .channel("live-stream-state")
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "live_stream_state",
+          filter: "stream_key=eq.global",
+        },
+        (payload) => {
+          const nextRow = payload.new as LiveStreamState | undefined;
+          if (!nextRow || cancelled) {
+            return;
+          }
 
-    liveStreamPhaseRef.current = "disturbance";
-    setLiveStreamPhase("disturbance");
-    setLiveSourceClass(initialClass);
-    void loadWaveform({ mode: "single", className: initialClass, sampleIndex: 0 });
-  }, [datasetMeta, simulationMode]);
+          setLiveStreamState(nextRow);
+          setLiveSourceClass(nextRow.class_name);
+        },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      void supabase.removeChannel(channel);
+    };
+  }, []);
 
   useEffect(() => {
-    if (simulationMode !== "single" || !selectedClass) {
-      return;
+    let cancelled = false;
+
+    async function refreshIfNeeded() {
+      if (!liveStreamState) {
+        return;
+      }
+
+      const staleAt = new Date(liveStreamState.started_at).getTime() + liveStreamState.duration_ms;
+      if (Date.now() < staleAt + 250) {
+        return;
+      }
+
+      try {
+        const response = await fetch("/api/grid/live-stream", { cache: "no-store" });
+        const json = await readApiResponse<LiveStreamState | null>(response);
+        if (!cancelled && response.ok && json.ok && json.data) {
+          setLiveStreamState(json.data);
+          setLiveSourceClass(json.data.class_name);
+        }
+      } catch {
+        // Keep the current shared state and try again on the next interval tick.
+      }
     }
 
-    void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: 0 });
-  }, [selectedClass, simulationMode]);
+    const timer = window.setInterval(() => {
+      void refreshIfNeeded();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [liveStreamState]);
 
   useEffect(() => {
-    if (!signal?.length) {
-      setPlaybackIndex(0);
+    const timer = window.setInterval(() => {
+      setStreamNowMs(Date.now());
+    }, 100);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!signal?.length || liveStreamState) {
+      if (!signal?.length) {
+        setPlaybackIndex(0);
+      }
       return;
     }
 
@@ -338,68 +440,25 @@ export function WaveformClassifierCard() {
     }, 20);
 
     return () => window.clearInterval(timer);
-  }, [signal]);
+  }, [liveStreamState, signal]);
 
   useEffect(() => {
-    if (!autoplay || loading) {
+    if (!liveStreamState) {
       return;
     }
 
-    if (simulationMode === "single" && !selectedClass) {
+    const eventKey = `${liveStreamState.class_name}:${liveStreamState.sample_index}:${liveStreamState.started_at}`;
+    if (lastSharedEventKeyRef.current === eventKey) {
       return;
     }
 
-    const timer = window.setTimeout(() => {
-      if (simulationMode === "all") {
-        void loadNextLiveStreamWaveform();
-        return;
-      }
-
-      const total = simulationInfo?.totalSamples ?? datasetMeta?.samplesPerClass ?? 1000;
-      const nextIndex =
-        simulationInfo ? (simulationInfo.sampleIndex + 1) % total : (selectedIndex + 1) % total;
-      void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: nextIndex });
-    }, LIVE_STREAM_INTERVAL_MS);
-
-    return () => window.clearTimeout(timer);
-  }, [
-    autoplay,
-    loading,
-    simulationMode,
-    selectedClass,
-    selectedIndex,
-    simulationInfo,
-    datasetMeta?.samplesPerClass,
-  ]);
-
-  async function loadNextLiveStreamWaveform() {
-    if (!datasetMeta) {
-      return;
-    }
-
-    const normalClass = getNormalClass(datasetMeta.classes);
-
-    if (!normalClass) {
-      return;
-    }
-
-    if (liveStreamPhaseRef.current === "disturbance") {
-      const disturbanceClasses = datasetMeta.classes.filter((className) => className !== normalClass);
-      const nextDisturbanceClass =
-        disturbanceClasses[Math.floor(Math.random() * disturbanceClasses.length)] ?? normalClass;
-
-      liveStreamPhaseRef.current = "normal";
-      setLiveStreamPhase("normal");
-      setLiveSourceClass(nextDisturbanceClass);
-      await loadWaveform({ mode: "single", className: nextDisturbanceClass, random: true });
-      return;
-    }
-
-    liveStreamPhaseRef.current = "disturbance";
-    setLiveStreamPhase("disturbance");
-    setLiveSourceClass(normalClass);
-    await loadWaveform({ mode: "single", className: normalClass, random: true });
-  }
+    lastSharedEventKeyRef.current = eventKey;
+    setLiveSourceClass(liveStreamState.class_name);
+    void loadWaveform({
+      className: liveStreamState.class_name,
+      sampleIndex: liveStreamState.sample_index,
+    });
+  }, [liveStreamState]);
 
   function handleTextParse(raw: string) {
     const parsed = parseSignalInput(raw);
@@ -466,7 +525,7 @@ export function WaveformClassifierCard() {
         body: JSON.stringify(payload),
       });
 
-      const json = (await response.json()) as ApiResponse<OperationalExplanation | null>;
+      const json = await readApiResponse<OperationalExplanation | null>(response);
       if (!response.ok || !json.ok || !json.data) {
         return fallback;
       }
@@ -530,7 +589,7 @@ export function WaveformClassifierCard() {
         }),
       });
 
-      const json = (await response.json()) as ApiResponse<ClassifierResponse | null>;
+      const json = await readApiResponse<ClassifierResponse | null>(response);
       if (!json.ok || !json.data) {
         throw new Error(json.error ?? "Classification failed.");
       }
@@ -644,32 +703,23 @@ export function WaveformClassifierCard() {
   }
 
   async function loadWaveform({
-    mode,
     className,
     sampleIndex,
-    random = false,
   }: {
-    mode: SimulationMode;
-    className?: string;
-    sampleIndex?: number;
-    random?: boolean;
+    className: string;
+    sampleIndex: number;
   }) {
     try {
       setLoading(true);
       setError(null);
 
-      const params = new URLSearchParams();
-      if (mode === "single" && className) {
-        params.set("className", className);
-      }
-      if (mode === "all" || random) {
-        params.set("random", "true");
-      } else {
-        params.set("sampleIndex", String(sampleIndex ?? 0));
-      }
+      const params = new URLSearchParams({
+        className,
+        sampleIndex: String(sampleIndex),
+      });
 
       const response = await fetch(`/api/grid/waveform?${params.toString()}`, { cache: "no-store" });
-      const json = (await response.json()) as ApiResponse<WaveformSample | null>;
+      const json = await readApiResponse<WaveformSample | null>(response);
       if (!json.ok || !json.data) {
         throw new Error(json.error ?? "Failed to load waveform sample.");
       }
@@ -678,7 +728,6 @@ export function WaveformClassifierCard() {
       setSignal(sample.signal);
       setInputValue(sample.signal.join(", "));
       setSimulationInfo(sample);
-      setSelectedIndex(sample.sampleIndex);
       setLiveSourceClass(sample.className);
       setSelectedFile(null);
       setConfidenceGateMessage(null);
@@ -704,66 +753,25 @@ export function WaveformClassifierCard() {
                 <div>
                   <p className="text-sm font-medium text-white">Live Disturbance Stream</p>
                   <p className="mt-1 text-sm text-slate-400">
-                    Starts from a pure sinusoidal waveform.
+                    Shared across devices from the backend-authoritative live stream state.
                   </p>
                 </div>
                 <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium text-cyan-200">
-                  Normal / disturbance cycle
+                  Synced stream
                 </span>
               </div>
             </div>
 
             <p className="mt-4 text-sm text-slate-400">
-              The stream now alternates between a normal waveform and a randomly selected disturbance for telemetry, confident AI predictions, explanations, and chart updates.
+              Every client listens to the same shared event row and derives playback from its server start time instead of choosing classes locally.
             </p>
-
-            <div className="mt-4 flex flex-wrap gap-3">
-              <button
-                type="button"
-                onClick={() => void loadNextLiveStreamWaveform()}
-                disabled={loading}
-                className="rounded-full bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 transition disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {loading ? "Running..." : "Run Stream Step"}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  liveStreamPhaseRef.current = "disturbance";
-                  setLiveStreamPhase("disturbance");
-                  if (!datasetMeta) {
-                    return;
-                  }
-
-                  const normalClass = getNormalClass(datasetMeta.classes);
-
-                  if (!normalClass) {
-                    return;
-                  }
-
-                  setLiveSourceClass(normalClass);
-                  void loadWaveform({ mode: "single", className: normalClass, sampleIndex: 0 });
-                }}
-                disabled={loading}
-                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Refresh Stream
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setAutoplay((current) => !current)}
-                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {autoplay ? "Pause Live Stream" : "Start Live Stream"}
-              </button>
-            </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-3 text-xs uppercase tracking-[0.16em] text-slate-500">
               <span>{signal ? "100-point waveform loaded" : "Waiting for waveform sample"}</span>
-              <span>mode: live dataset stream</span>
+              <span>mode: shared realtime stream</span>
+              {liveStreamState ? <span>phase: {liveStreamState.phase}</span> : null}
               {liveSourceClass ? <span>source: {liveSourceClass}</span> : null}
+              {liveStreamState ? <span>duration: {liveStreamState.duration_ms} ms</span> : null}
               {selectedFile ? <span>manual file: {selectedFile}</span> : null}
             </div>
 
@@ -991,16 +999,16 @@ export function WaveformClassifierCard() {
                   </div>
 
                   <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                      <p className="text-xs font-medium text-slate-400">AI answer</p>
-                      <p className="mt-2 text-sm text-white">{result.predicted_class}</p>
-                    </div>
-                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                      <p className="text-xs font-medium text-slate-400">Stream status</p>
-                      <p className="mt-2 text-sm text-white">{autoplay ? "Streaming live" : "Paused"}</p>
-                    </div>
-                  </div>
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <p className="text-xs font-medium text-slate-400">AI answer</p>
+                  <p className="mt-2 text-sm text-white">{result.predicted_class}</p>
                 </div>
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <p className="text-xs font-medium text-slate-400">Stream status</p>
+                  <p className="mt-2 text-sm text-white">{liveStreamState ? "Synced live" : "Waiting for state"}</p>
+                </div>
+              </div>
+            </div>
 
               </div>
             )}
@@ -1116,7 +1124,10 @@ export function WaveformClassifierCard() {
                   }));
 
                   return (
-                    <div key={`${entry.run}-${entry.timestamp}`} className="space-y-3">
+                    <div
+                      key={`${entry.run}-${entry.sourceClass}-${entry.sourceIndex}-${entry.predictedLabel}`}
+                      className="space-y-3"
+                    >
                       <button
                         type="button"
                         onClick={() =>

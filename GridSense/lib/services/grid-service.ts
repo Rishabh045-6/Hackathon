@@ -15,6 +15,7 @@ import type {
 } from "@/types/grid";
 
 const DEFAULT_LIMIT = 24;
+const MAX_PREDICTION_LOG_RETENTION = 100;
 
 type NumericReadingRow = Omit<
   GridReading,
@@ -415,6 +416,33 @@ export async function createPredictionLog(
 
   if (error) {
     return { data: null, error: error.message };
+  }
+
+  const staleLogsResult = await supabase
+    .from("prediction_logs")
+    .select("id")
+    .eq("user_id", userResult.data)
+    .order("created_at", { ascending: false })
+    .range(MAX_PREDICTION_LOG_RETENTION, MAX_PREDICTION_LOG_RETENTION + 500);
+
+  if (staleLogsResult.error) {
+    return { data: null, error: staleLogsResult.error.message };
+  }
+
+  const staleIds = (staleLogsResult.data ?? [])
+    .map((row) => String(row.id))
+    .filter(Boolean);
+
+  if (staleIds.length > 0) {
+    const deleteResult = await supabase
+      .from("prediction_logs")
+      .delete()
+      .eq("user_id", userResult.data)
+      .in("id", staleIds);
+
+    if (deleteResult.error) {
+      return { data: null, error: deleteResult.error.message };
+    }
   }
 
   return {

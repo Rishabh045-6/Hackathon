@@ -22,6 +22,20 @@ type ApiResponse<T> = {
   error: string | null;
 };
 
+async function readApiResponse<T>(response: Response): Promise<ApiResponse<T>> {
+  const text = await response.text();
+
+  if (!text.trim()) {
+    return { ok: false, data: null as T, error: "The server returned an empty response." };
+  }
+
+  try {
+    return JSON.parse(text) as ApiResponse<T>;
+  } catch {
+    return { ok: false, data: null as T, error: "The server returned an invalid JSON response." };
+  }
+}
+
 export default function AlertsPage() {
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
@@ -35,7 +49,7 @@ export default function AlertsPage() {
     async function loadAlerts() {
       try {
         const response = await fetch("/api/alerts?limit=50", { cache: "no-store" });
-        const json = (await response.json()) as ApiResponse<Alert[]>;
+        const json = await readApiResponse<Alert[]>(response);
 
         if (!response.ok || !json.ok) {
           if (!cancelled) {
@@ -86,7 +100,7 @@ export default function AlertsPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ alertId, status }),
       });
-      const json = (await response.json()) as ApiResponse<Alert | null>;
+      const json = await readApiResponse<Alert | null>(response);
 
       if (!response.ok || !json.ok || !json.data) {
         throw new Error(json.error ?? "Failed to update alert.");

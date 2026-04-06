@@ -37,6 +37,20 @@ type WaveformApiResponse = {
   error: string | null;
 };
 
+async function readWaveformApiResponse(response: Response): Promise<WaveformApiResponse> {
+  const text = await response.text();
+
+  if (!text.trim()) {
+    return { ok: false, data: null, error: "The server returned an empty response." };
+  }
+
+  try {
+    return JSON.parse(text) as WaveformApiResponse;
+  } catch {
+    return { ok: false, data: null, error: "The server returned an invalid JSON response." };
+  }
+}
+
 function computeSignalMetrics(values: number[]) {
   if (values.length === 0) {
     return { rms: 0, peak: 0, trough: 0, mean: 0, span: 0 };
@@ -52,7 +66,8 @@ function computeSignalMetrics(values: number[]) {
 }
 
 export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
-  const [selectedLogId, setSelectedLogId] = useState<string>(logs[0]?.id ?? "");
+  const [selectedLogId, setSelectedLogId] = useState<string>("");
+  const [detailOpen, setDetailOpen] = useState(false);
   const [resolvedSignal, setResolvedSignal] = useState<number[] | null>(null);
   const [signalLoading, setSignalLoading] = useState(false);
   const [signalError, setSignalError] = useState<string | null>(null);
@@ -62,13 +77,14 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
       return;
     }
 
-    if (!selectedLogId || !logs.some((log) => log.id === selectedLogId)) {
-      setSelectedLogId(logs[0].id);
+    if (selectedLogId && !logs.some((log) => log.id === selectedLogId)) {
+      setSelectedLogId("");
+      setDetailOpen(false);
     }
   }, [logs, selectedLogId]);
 
   const selectedLog = useMemo(
-    () => logs.find((log) => log.id === selectedLogId) ?? logs[0] ?? null,
+    () => logs.find((log) => log.id === selectedLogId) ?? null,
     [logs, selectedLogId],
   );
   const signalValues = resolvedSignal ?? selectedLog?.signal_preview ?? [];
@@ -123,7 +139,7 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
           sampleIndex: String(selectedLog.sample_index),
         });
         const response = await fetch(`/api/grid/waveform?${params.toString()}`, { cache: "no-store" });
-        const json = (await response.json()) as WaveformApiResponse;
+        const json = await readWaveformApiResponse(response);
 
         if (!response.ok || !json.ok || !json.data?.signal) {
           throw new Error(json.error ?? "Failed to load waveform.");
@@ -156,12 +172,6 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
     return <p className="text-sm text-slate-400">No prediction logs have been stored yet.</p>;
   }
 
-  if (!selectedLog) {
-    return <p className="text-sm text-slate-400">Select a prediction log to inspect it.</p>;
-  }
-
-  const explanation = getClassifierExplanation(selectedLog.predicted_label);
-
   return (
     <div className="space-y-6">
       <div className="overflow-x-auto">
@@ -177,22 +187,26 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
           </thead>
           <tbody>
             {logs.map((log) => {
-              const isSelected = log.id === selectedLog.id;
+              const isSelected = log.id === selectedLog?.id;
 
               return (
                 <tr
                   key={log.id}
-                  onClick={() => setSelectedLogId(log.id)}
+                  onClick={() => {
+                    setSelectedLogId(log.id);
+                    setDetailOpen(true);
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
                       setSelectedLogId(log.id);
+                      setDetailOpen(true);
                     }
                   }}
                   role="button"
                   tabIndex={0}
                   className={`border-b border-white/5 align-top transition cursor-pointer ${
-                    isSelected ? "bg-cyan-400/10" : "hover:bg-white/5"
+                    isSelected && detailOpen ? "bg-cyan-400/10" : "hover:bg-white/5"
                   }`}
                 >
                   <td className="py-4 pr-4 text-slate-300">{formatLogTimestamp(log.created_at)}</td>
@@ -212,123 +226,152 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
         </table>
       </div>
 
-      <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-        <p className="text-sm font-medium text-white">Selected Log Details</p>
-        <div className="mt-5 grid gap-5 xl:grid-cols-2">
-          <div className="space-y-5">
-            <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
-              <p className="text-sm font-medium text-white">Waveform Preview</p>
-              {signalLoading ? (
-                <p className="mt-3 text-sm text-slate-400">Loading full waveform for this log...</p>
-              ) : null}
-              {waveformData.length === 0 ? (
-                <p className="mt-3 text-sm text-slate-400">No waveform preview was stored for this log.</p>
-              ) : (
-                <div className="mt-3">
-                  <LineChartCard
-                    data={waveformData}
-                    xKey="sample"
-                    series={[{ dataKey: "amplitude", name: "Amplitude", color: "#22d3ee" }]}
-                  />
-                </div>
-              )}
-              {signalError ? <p className="mt-3 text-xs text-slate-500">{signalError}</p> : null}
-            </div>
+      {detailOpen && selectedLog ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4" onClick={() => setDetailOpen(false)}>
+          <div
+            className="max-h-[90vh] w-full max-w-6xl overflow-y-auto rounded-3xl border border-white/10 bg-slate-900 p-5 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {(() => {
+              const activeLog = selectedLog;
+              const explanation = getClassifierExplanation(activeLog.predicted_label);
 
-            <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
-              <p className="text-sm font-medium text-white">Signal Metrics</p>
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Peak amplitude</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.peak.toFixed(4)}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Trough amplitude</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.trough.toFixed(4)}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Amplitude span</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.span.toFixed(4)}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">RMS</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.rms.toFixed(4)}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Mean</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.mean.toFixed(4)}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Loaded samples</p>
-                  <p className="mt-2 text-sm font-semibold text-white">
-                    {signalValues.length} / {selectedLog.signal_length}
-                  </p>
-                </div>
-              </div>
-            </div>
+              return (
+                <div>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-lg font-semibold text-white">Selected Log Details</p>
+                      <p className="mt-1 text-sm text-slate-400">{activeLog.predicted_class}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setDetailOpen(false)}
+                      className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10"
+                    >
+                      Close
+                    </button>
+                  </div>
 
-            <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
-              <p className="text-sm font-medium text-white">Top Predictions</p>
-              {topPredictions.length === 0 ? (
-                <p className="mt-3 text-sm text-slate-400">No class ranking was stored for this log.</p>
-              ) : (
-                <div className="mt-3">
-                  <BarChartCard data={topPredictions} xKey="className" yKey="confidence" color="#22d3ee" />
-                </div>
-              )}
-            </div>
-          </div>
+                  <div className="mt-5 grid gap-5 xl:grid-cols-2">
+                    <div className="space-y-5">
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
+                        <p className="text-sm font-medium text-white">Waveform Preview</p>
+                        {signalLoading ? (
+                          <p className="mt-3 text-sm text-slate-400">Loading full waveform for this log...</p>
+                        ) : null}
+                        {waveformData.length === 0 ? (
+                          <p className="mt-3 text-sm text-slate-400">No waveform preview was stored for this log.</p>
+                        ) : (
+                          <div className="mt-3">
+                            <LineChartCard
+                              data={waveformData}
+                              xKey="sample"
+                              series={[{ dataKey: "amplitude", name: "Amplitude", color: "#22d3ee" }]}
+                            />
+                          </div>
+                        )}
+                        {signalError ? <p className="mt-3 text-xs text-slate-500">{signalError}</p> : null}
+                      </div>
 
-          <div className="space-y-5">
-            <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
-              <p className="text-sm font-medium text-white">Prediction Summary</p>
-              <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Predicted class</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{selectedLog.predicted_class}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Confidence</p>
-                  <p className="mt-2 text-sm font-semibold text-white">
-                    {(selectedLog.confidence * 100).toFixed(2)}%
-                  </p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Severity</p>
-                  <p className="mt-2 text-sm font-semibold capitalize text-white">{explanation.severity}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Timestamp</p>
-                  <p className="mt-2 text-sm font-semibold text-white">{formatLogTimestamp(selectedLog.created_at)}</p>
-                </div>
-              </div>
-              <div className="mt-4">
-                <SeverityBadge value={explanation.severity} />
-              </div>
-            </div>
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
+                        <p className="text-sm font-medium text-white">Signal Metrics</p>
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Peak amplitude</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.peak.toFixed(4)}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Trough amplitude</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.trough.toFixed(4)}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Amplitude span</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.span.toFixed(4)}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">RMS</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.rms.toFixed(4)}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Mean</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{signalMetrics.mean.toFixed(4)}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Loaded samples</p>
+                            <p className="mt-2 text-sm font-semibold text-white">
+                              {signalValues.length} / {activeLog.signal_length}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
 
-            <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
-              <p className="text-sm font-medium text-white">Explanation</p>
-              <div className="mt-4 space-y-4">
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Summary</p>
-                  <p className="mt-2 text-sm text-white">
-                    {selectedLog.explanation_summary ?? explanation.summary}
-                  </p>
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
+                        <p className="text-sm font-medium text-white">Top Predictions</p>
+                        {topPredictions.length === 0 ? (
+                          <p className="mt-3 text-sm text-slate-400">No class ranking was stored for this log.</p>
+                        ) : (
+                          <div className="mt-3">
+                            <BarChartCard data={topPredictions} xKey="className" yKey="confidence" color="#22d3ee" />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="space-y-5">
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
+                        <p className="text-sm font-medium text-white">Prediction Summary</p>
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Predicted class</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{activeLog.predicted_class}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Confidence</p>
+                            <p className="mt-2 text-sm font-semibold text-white">
+                              {(activeLog.confidence * 100).toFixed(2)}%
+                            </p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Severity</p>
+                            <p className="mt-2 text-sm font-semibold capitalize text-white">{explanation.severity}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Timestamp</p>
+                            <p className="mt-2 text-sm font-semibold text-white">{formatLogTimestamp(activeLog.created_at)}</p>
+                          </div>
+                        </div>
+                        <div className="mt-4">
+                          <SeverityBadge value={explanation.severity} />
+                        </div>
+                      </div>
+
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-5">
+                        <p className="text-sm font-medium text-white">Explanation</p>
+                        <div className="mt-4 space-y-4">
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Summary</p>
+                            <p className="mt-2 text-sm text-white">
+                              {activeLog.explanation_summary ?? explanation.summary}
+                            </p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Likely cause</p>
+                            <p className="mt-2 text-sm text-slate-300">{explanation.likelyCause}</p>
+                          </div>
+                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <p className="text-xs font-medium text-slate-500">Recommended action</p>
+                            <p className="mt-2 text-sm text-slate-300">{explanation.recommendedAction}</p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Likely cause</p>
-                  <p className="mt-2 text-sm text-slate-300">{explanation.likelyCause}</p>
-                </div>
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <p className="text-xs font-medium text-slate-500">Recommended action</p>
-                  <p className="mt-2 text-sm text-slate-300">{explanation.recommendedAction}</p>
-                </div>
-              </div>
-            </div>
+              );
+            })()}
           </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 }

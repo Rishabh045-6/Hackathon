@@ -71,6 +71,17 @@ create table if not exists public.prediction_logs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.live_stream_state (
+  id uuid primary key default gen_random_uuid(),
+  stream_key text not null unique,
+  phase text not null check (phase in ('normal', 'disturbance')),
+  class_name text not null,
+  sample_index integer not null,
+  started_at timestamptz not null,
+  duration_ms integer not null,
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.anomalies (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
@@ -122,6 +133,9 @@ create index if not exists idx_predictions_user_predicted_for
 create index if not exists idx_prediction_logs_user_created_at
   on public.prediction_logs (user_id, created_at desc);
 
+create index if not exists idx_live_stream_state_stream_key
+  on public.live_stream_state (stream_key);
+
 create index if not exists idx_anomalies_user_detected_at
   on public.anomalies (user_id, detected_at desc);
 
@@ -147,3 +161,10 @@ drop trigger if exists set_app_settings_updated_at on public.app_settings;
 create trigger set_app_settings_updated_at
 before update on public.app_settings
 for each row execute procedure public.set_updated_at();
+
+drop trigger if exists set_live_stream_state_updated_at on public.live_stream_state;
+create trigger set_live_stream_state_updated_at
+before update on public.live_stream_state
+for each row execute procedure public.set_updated_at();
+
+alter publication supabase_realtime add table public.live_stream_state;

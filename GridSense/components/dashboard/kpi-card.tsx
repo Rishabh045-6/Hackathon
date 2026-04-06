@@ -19,9 +19,11 @@ export function KpiCard({
           : "text-cyan-300";
 
   return (
-    <div className="rounded-3xl border border-white/10 bg-slate-900/80 p-5">
+    <div className="min-w-0 rounded-3xl border border-white/10 bg-slate-900/80 p-5">
       <p className="text-sm text-slate-400">{label}</p>
-      <p className={`mt-3 text-3xl font-semibold ${toneClass}`}>{value}</p>
+      <p className={`mt-3 overflow-hidden break-words text-3xl font-semibold leading-tight ${toneClass}`}>
+        {value}
+      </p>
       <p className="mt-2 text-xs uppercase tracking-[0.18em] text-slate-500">{hint}</p>
     </div>
   );

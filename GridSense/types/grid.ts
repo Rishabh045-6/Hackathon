@@ -7,6 +7,7 @@ export type ModelMode = "simulated" | "rule-based" | "ml-ready";
 export type GridStatus = "stable" | "warning" | "critical";
 
 export type ReadingSource = "seed" | "simulated" | "manual" | "ingested";
+export type LiveStreamPhase = "normal" | "disturbance";
 
 export interface Profile {
   id: string;
@@ -60,6 +61,17 @@ export interface PredictionLog {
   source_identifier: string | null;
   top_k: PredictionLogEntry[];
   created_at: string;
+}
+
+export interface LiveStreamState {
+  id: string;
+  stream_key: string;
+  phase: LiveStreamPhase;
+  class_name: string;
+  sample_index: number;
+  started_at: string;
+  duration_ms: number;
+  updated_at: string;
 }
 
 export interface Anomaly {

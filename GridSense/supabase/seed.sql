@@ -76,6 +76,30 @@ select id, 72.4, 0.84, 'baseline-simulator', 60, now() + interval '15 minutes' f
 union all
 select id, 79.6, 0.81, 'baseline-simulator', 60, now() + interval '30 minutes' from seed_user;
 
+insert into public.live_stream_state (
+  stream_key,
+  phase,
+  class_name,
+  sample_index,
+  started_at,
+  duration_ms
+)
+values (
+  'global',
+  'normal',
+  'Pure_Sinusoidal',
+  0,
+  now(),
+  7000
+)
+on conflict (stream_key) do update
+set phase = excluded.phase,
+    class_name = excluded.class_name,
+    sample_index = excluded.sample_index,
+    started_at = excluded.started_at,
+    duration_ms = excluded.duration_ms,
+    updated_at = now();
+
 with seed_user as (
   select id
   from auth.users

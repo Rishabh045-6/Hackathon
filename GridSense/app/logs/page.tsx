@@ -8,7 +8,7 @@ import { getPredictionLogs } from "@/lib/services/grid-service";
 
 export default async function LogsPage() {
   const supabase = await createClient();
-  const logsResult = await getPredictionLogs(supabase, 200);
+  const logsResult = await getPredictionLogs(supabase, 100);
 
   if (logsResult.error) {
     return (
