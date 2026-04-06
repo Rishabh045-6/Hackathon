@@ -181,6 +181,7 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
               <th className="pb-3 pr-4 font-medium">Time</th>
               <th className="pb-3 pr-4 font-medium">Predicted Class</th>
               <th className="pb-3 pr-4 font-medium">Confidence</th>
+              <th className="pb-3 pr-4 font-medium">Severity</th>
               <th className="pb-3 pr-4 font-medium">Source Class</th>
               <th className="pb-3 pr-4 font-medium">Summary</th>
             </tr>
@@ -188,6 +189,7 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
           <tbody>
             {logs.map((log) => {
               const isSelected = log.id === selectedLog?.id;
+              const severity = getClassifierExplanation(log.predicted_label).severity;
 
               return (
                 <tr
@@ -217,6 +219,9 @@ export function PredictionLogExplorer({ logs }: PredictionLogExplorerProps) {
                     </div>
                   </td>
                   <td className="py-4 pr-4 text-white">{(log.confidence * 100).toFixed(2)}%</td>
+                  <td className="py-4 pr-4">
+                    <SeverityBadge value={severity} />
+                  </td>
                   <td className="py-4 pr-4 text-slate-300">{log.source_class ?? "N/A"}</td>
                   <td className="py-4 pr-0 max-w-xl text-slate-300">{log.explanation_summary ?? "No summary stored."}</td>
                 </tr>
