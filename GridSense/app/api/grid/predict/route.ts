@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { getClassifierExplanation } from "@/lib/classifier-explanations";
 import { createPredictionLog } from "@/lib/services/grid-service";
 import { getPredictions } from "@/lib/services/grid-service";
+import { createAlertRecord } from "@/lib/services/alert-service";
 
 export const runtime = "nodejs";
 const CONFIDENCE_THRESHOLD = 0.9;
@@ -68,8 +69,8 @@ function readOptionalInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) ? value : null;
 }
 
-function buildSignalPreview(signal: number[]) {
-  return signal.slice(0, 12).map((value) => Number(value.toFixed(6)));
+function buildStoredSignal(signal: number[]) {
+  return signal.map((value) => Number(value.toFixed(6)));
 }
 
 function shouldPersistPrediction(result: ClassifierResult, sourceClass: string | null) {
@@ -160,7 +161,7 @@ export async function POST(request: Request) {
         confidence: result.confidence,
         source_class: sourceClass,
         sample_index: readOptionalInteger(body.sample_index),
-        signal_preview: buildSignalPreview(body.signal),
+        signal_preview: buildStoredSignal(body.signal),
         signal_length: body.signal.length,
         explanation_summary: explanation.summary,
         model_name: MODEL_NAME,
@@ -170,6 +171,19 @@ export async function POST(request: Request) {
 
       if (logResult.error) {
         throw new Error(logResult.error);
+      }
+
+      if (explanation.severity === "high") {
+        const alertResult = await createAlertRecord(supabase, {
+          title: `Critical Disturbance: ${result.predicted_class}`,
+          message: explanation.summary,
+          priority: "high",
+          triggered_by: "analytics-waveform-classifier",
+        });
+
+        if (alertResult.error) {
+          throw new Error(alertResult.error);
+        }
       }
     }
 

@@ -8,48 +8,65 @@ import { SeverityBadge, StatusBadge } from "@/components/dashboard/status-badge"
 import { AppShell } from "@/components/layout/app-shell";
 import { StatePanel } from "@/components/layout/state-panel";
 import {
-  createAnomaliesFromReading,
-  createCriticalAlertFromReading,
-  createInitialAlerts,
-  createInitialAnomalies,
   createInitialReadings,
   stepReading,
 } from "@/lib/live-sim";
-import type { Alert, Anomaly, GridReading } from "@/types/grid";
+import { getClassifierExplanation } from "@/lib/classifier-explanations";
+import type { Alert, Anomaly, GridReading, PredictionLog } from "@/types/grid";
 
-const REPEAT_COOLDOWN_MS = 12_000;
+type ApiResponse<T> = {
+  ok: boolean;
+  data: T;
+  error: string | null;
+};
 
-function isRecent(timestamp: string) {
-  return Date.now() - new Date(timestamp).getTime() < REPEAT_COOLDOWN_MS;
+const DISTURBANCE_POLL_MS = 4_000;
+
+function toAnomalyFromLog(log: PredictionLog): Anomaly {
+  const explanation = getClassifierExplanation(log.predicted_label);
+
+  return {
+    id: `dashboard-anomaly-${log.id}`,
+    user_id: log.user_id,
+    reading_id: null,
+    anomaly_type: log.predicted_class.toLowerCase().replace(/\s+/g, "_"),
+    severity: explanation.severity,
+    metric: "waveform",
+    observed_value: Number((log.confidence * 100).toFixed(2)),
+    threshold_value: 90,
+    description: log.explanation_summary ?? explanation.summary,
+    detected_at: log.created_at,
+    resolved: false,
+    created_at: log.created_at,
+  };
+}
+
+function toAlertFromLog(log: PredictionLog): Alert | null {
+  const explanation = getClassifierExplanation(log.predicted_label);
+  if (explanation.severity !== "high") {
+    return null;
+  }
+
+  return {
+    id: `dashboard-alert-${log.id}`,
+    user_id: log.user_id,
+    anomaly_id: null,
+    title: `Critical Disturbance: ${log.predicted_class}`,
+    message: log.explanation_summary ?? explanation.summary,
+    status: "open",
+    priority: "high",
+    triggered_by: "analytics-waveform-classifier",
+    created_at: log.created_at,
+  };
 }
 
 function getAnomalyLabel(anomaly: Anomaly) {
-  if (anomaly.anomaly_type === "high_load") {
-    return "High Load";
-  }
-
-  if (anomaly.anomaly_type === "voltage_sag") {
-    return "Voltage Sag";
-  }
-
-  if (anomaly.anomaly_type === "voltage_swell") {
-    return "Voltage Swell";
-  }
-
-  return anomaly.metric.replace(/_/g, " ");
+  return anomaly.anomaly_type.replace(/_/g, " ");
 }
 export default function DashboardPage() {
   const [readings, setReadings] = useState<GridReading[]>(() => createInitialReadings(24, "dashboard"));
-  const [alerts, setAlerts] = useState<Alert[]>(() =>
-    createInitialAlerts(createInitialReadings(12, "dashboard-alerts"), 12, "live-dashboard-simulator", "dashboard event")
-      .filter((alert) => alert.priority === "high")
-      .slice(0, 3),
-  );
-  const [anomalies, setAnomalies] = useState<Anomaly[]>(() =>
-    createInitialAnomalies(createInitialReadings(12, "dashboard-anomalies"), 12, "dashboard")
-      .filter((anomaly) => anomaly.severity === "high")
-      .slice(0, 3),
-  );
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
 
   useEffect(() => {
     if (readings.length === 0) {
@@ -64,44 +81,56 @@ export default function DashboardPage() {
         }
         const nextReading = stepReading(base, "dashboard");
 
-        setAnomalies((currentAnomalies) => {
-          const nextHighAnomalies = createAnomaliesFromReading(nextReading, "dashboard").filter(
-            (anomaly) => anomaly.severity === "high",
-          );
-
-          const dedupedNewItems = nextHighAnomalies.filter((anomaly) => {
-            const existing = currentAnomalies.find(
-              (current) => current.anomaly_type === anomaly.anomaly_type && isRecent(current.detected_at),
-            );
-            return !existing;
-          });
-
-          return [...dedupedNewItems, ...currentAnomalies].slice(0, 3);
-        });
-
-        setAlerts((currentAlerts) => {
-          const nextAlert = createCriticalAlertFromReading(nextReading, "live-dashboard-simulator");
-          if (!nextAlert) {
-            return currentAlerts;
-          }
-
-          const duplicateRecentAlert = currentAlerts.find(
-            (alert) => alert.title === nextAlert.title && isRecent(alert.created_at),
-          );
-
-          if (duplicateRecentAlert) {
-            return currentAlerts;
-          }
-
-          return [nextAlert, ...currentAlerts].slice(0, 3);
-        });
-
         return [...current.slice(-23), nextReading];
       });
     }, 2000);
 
     return () => window.clearInterval(timer);
   }, [readings.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDisturbances() {
+      try {
+        const response = await fetch("/api/grid/prediction-logs?limit=24", { cache: "no-store" });
+        const json = (await response.json()) as ApiResponse<PredictionLog[]>;
+
+        if (!response.ok || !json.ok) {
+          return;
+        }
+
+        const recentLogs = json.data ?? [];
+        const nextAnomalies = recentLogs
+          .map(toAnomalyFromLog)
+          .slice(0, 3);
+        const nextAlerts = recentLogs
+          .map(toAlertFromLog)
+          .filter((alert): alert is Alert => alert !== null)
+          .slice(0, 3);
+
+        if (!cancelled) {
+          setAnomalies(nextAnomalies);
+          setAlerts(nextAlerts);
+        }
+      } catch {
+        if (!cancelled) {
+          setAnomalies([]);
+          setAlerts([]);
+        }
+      }
+    }
+
+    void loadDisturbances();
+    const timer = window.setInterval(() => {
+      void loadDisturbances();
+    }, DISTURBANCE_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const latest = readings[readings.length - 1];
   const chartData = useMemo(
@@ -150,10 +179,10 @@ export default function DashboardPage() {
           />
         </PanelCard>
 
-        <PanelCard title="Anomaly Summary" subtitle="Only fresh high-severity operating problems are shown here. Repeated readings of the same issue are suppressed for a short cooldown.">
+        <PanelCard title="Anomaly Summary" subtitle="Recent disturbances detected by the Analytics waveform classifier are summarized here.">
           <div className="space-y-3">
             {anomalies.length === 0 ? (
-              <p className="text-sm text-slate-400">No high-severity anomaly right now.</p>
+              <p className="text-sm text-slate-400">No recent disturbance from Analytics.</p>
             ) : (
               anomalies.slice(0, 3).map((anomaly) => (
                 <div key={anomaly.id} className="rounded-2xl bg-white/5 p-4">
@@ -163,7 +192,7 @@ export default function DashboardPage() {
                   </div>
                   <p className="mt-2 text-sm text-slate-400">{anomaly.description}</p>
                   <p className="mt-2 text-xs uppercase tracking-[0.18em] text-slate-500">
-                    observed {anomaly.observed_value}
+                    confidence {anomaly.observed_value.toFixed(2)}%
                   </p>
                 </div>
               ))
@@ -184,10 +213,10 @@ export default function DashboardPage() {
           />
         </PanelCard>
 
-        <PanelCard title="Recent Alerts" subtitle="Only active high-priority alerts are shown. If nothing critical is happening, this stays empty.">
+        <PanelCard title="Recent Alerts" subtitle="High-severity disturbances from the Analytics page appear here as critical alerts.">
             <div className="space-y-3">
               {alerts.length === 0 ? (
-                <p className="text-sm text-slate-400">No critical alert right now.</p>
+                <p className="text-sm text-slate-400">No critical disturbance alert right now.</p>
               ) : (
                 alerts.slice(0, 3).map((alert) => (
                   <div key={alert.id} className="rounded-2xl bg-white/5 p-4">

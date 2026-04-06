@@ -1,91 +1,117 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { KpiCard } from "@/components/dashboard/kpi-card";
 import { PanelCard } from "@/components/dashboard/panel-card";
 import { SeverityBadge, StatusBadge } from "@/components/dashboard/status-badge";
 import { AppShell } from "@/components/layout/app-shell";
-import {
-  createCriticalAlertFromReading,
-  createCriticalDisturbanceAlert,
-  createInitialReadings,
-  stepReading,
-} from "@/lib/live-sim";
-import type { Alert, AlertStatus, GridReading } from "@/types/grid";
+import type { Alert, AlertStatus } from "@/types/grid";
 
 const statusOptions: AlertStatus[] = ["open", "acknowledged", "resolved"];
-const REPEAT_COOLDOWN_MS = 12_000;
-const DISTURBANCE_ALERT_CLASSES = [
-  { predictedLabel: 3, predictedClass: "Interruption" },
-  { predictedLabel: 4, predictedClass: "Transient" },
-  { predictedLabel: 7, predictedClass: "Flicker_with_Sag" },
-  { predictedLabel: 8, predictedClass: "Flicker_with_Swell" },
-  { predictedLabel: 12, predictedClass: "Sag_with_Oscillatory_Transient" },
-  { predictedLabel: 13, predictedClass: "Swell_with_Oscillatory_Transient" },
-  { predictedLabel: 14, predictedClass: "Sag_with_Harmonics" },
-  { predictedLabel: 15, predictedClass: "Swell_with_Harmonics" },
+const ALERT_REFRESH_MS = 4_000;
+const FILTERS: Array<{ id: AlertStatus | "all"; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "open", label: "Open" },
+  { id: "acknowledged", label: "Acknowledged" },
+  { id: "resolved", label: "Resolved" },
 ];
 
-function isRecent(timestamp: string) {
-  return Date.now() - new Date(timestamp).getTime() < REPEAT_COOLDOWN_MS;
-}
+type ApiResponse<T> = {
+  ok: boolean;
+  data: T;
+  error: string | null;
+};
 
 export default function AlertsPage() {
-  const [latestReading, setLatestReading] = useState<GridReading>(() => createInitialReadings(1, "alerts")[0]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState<AlertStatus | "all">("open");
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function loadAlerts() {
+      try {
+        const response = await fetch("/api/alerts?limit=50", { cache: "no-store" });
+        const json = (await response.json()) as ApiResponse<Alert[]>;
+
+        if (!response.ok || !json.ok) {
+          if (!cancelled) {
+            setError(json.error ?? "Failed to load alerts.");
+          }
+          return;
+        }
+
+        if (!cancelled) {
+          setAlerts(json.data ?? []);
+          setError(null);
+          setLastSyncedAt(new Date().toISOString());
+        }
+      } catch {
+        if (!cancelled) {
+          setError("Failed to load alerts.");
+        }
+      }
+    }
+
+    void loadAlerts();
     const timer = window.setInterval(() => {
-      setLatestReading((currentReading) => {
-        const nextReading = stepReading(currentReading, "alerts");
+      void loadAlerts();
+    }, ALERT_REFRESH_MS);
 
-        setAlerts((currentAlerts) => {
-          const readingAlert = createCriticalAlertFromReading(nextReading, "live-alerts-simulator");
-          const disturbanceSeed =
-            Math.random() < 0.35
-              ? DISTURBANCE_ALERT_CLASSES[
-                  Math.floor(Math.random() * DISTURBANCE_ALERT_CLASSES.length)
-                ]
-              : null;
-          const disturbanceAlert = disturbanceSeed
-            ? createCriticalDisturbanceAlert(
-                disturbanceSeed.predictedLabel,
-                disturbanceSeed.predictedClass,
-                "waveform-classifier",
-              )
-            : null;
-          const nextAlert = readingAlert ?? disturbanceAlert;
-
-          if (!nextAlert) {
-            return currentAlerts;
-          }
-
-          const duplicateRecentAlert = currentAlerts.find(
-            (alert) => alert.title === nextAlert.title && isRecent(alert.created_at),
-          );
-          if (duplicateRecentAlert) {
-            return currentAlerts;
-          }
-
-          return [nextAlert, ...currentAlerts].slice(0, 3);
-        });
-
-        return nextReading;
-      });
-    }, 3500);
-
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, []);
+
+  const filteredAlerts = useMemo(
+    () =>
+      alerts.filter((alert) => (activeFilter === "all" ? true : alert.status === activeFilter)),
+    [activeFilter, alerts],
+  );
+
+  const openCount = alerts.filter((alert) => alert.status === "open").length;
+  const acknowledgedCount = alerts.filter((alert) => alert.status === "acknowledged").length;
+  const resolvedCount = alerts.filter((alert) => alert.status === "resolved").length;
+  const criticalCount = alerts.filter((alert) => alert.priority === "high").length;
 
   async function updateStatus(alertId: string, status: AlertStatus) {
     try {
       setUpdatingId(alertId);
+      const response = await fetch("/api/alerts", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ alertId, status }),
+      });
+      const json = (await response.json()) as ApiResponse<Alert | null>;
+
+      if (!response.ok || !json.ok || !json.data) {
+        throw new Error(json.error ?? "Failed to update alert.");
+      }
+
       setAlerts((current) =>
-        current.map((alert) => (alert.id === alertId ? { ...alert, status } : alert)),
+        current.map((alert) => (alert.id === alertId ? json.data ?? alert : alert)),
       );
+      setError(null);
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : "Failed to update alert.");
     } finally {
       setUpdatingId(null);
     }
+  }
+
+  if (error) {
+    return (
+      <AppShell title="Alerts" subtitle="Operational events and response workflow.">
+        <div className="rounded-3xl border border-dashed border-white/10 bg-white/5 p-8 text-center">
+          <h2 className="text-lg font-semibold text-white">Alerts unavailable</h2>
+          <p className="mt-2 text-sm text-slate-400">{error}</p>
+        </div>
+      </AppShell>
+    );
   }
 
   if (alerts.length === 0) {
@@ -93,7 +119,7 @@ export default function AlertsPage() {
       <AppShell title="Alerts" subtitle="Operational events and response workflow.">
         <div className="rounded-3xl border border-dashed border-white/10 bg-white/5 p-8 text-center">
           <h2 className="text-lg font-semibold text-white">No alerts found</h2>
-          <p className="mt-2 text-sm text-slate-400">The live simulation has not generated any alerts yet.</p>
+          <p className="mt-2 text-sm text-slate-400">No backend alerts have been generated yet.</p>
         </div>
       </AppShell>
     );
@@ -101,54 +127,108 @@ export default function AlertsPage() {
 
   return (
     <AppShell title="Alerts" subtitle="Operational events and response workflow.">
-      <PanelCard title="Alert Queue" subtitle="Only critical operating alerts and high-severity AI disturbance alerts appear here. If nothing serious is happening, this stays empty.">
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-left text-sm">
-            <thead className="text-slate-400">
-              <tr className="border-b border-white/10">
-                <th className="pb-3 pr-4 font-medium">Title</th>
-                <th className="pb-3 pr-4 font-medium">Priority</th>
-                <th className="pb-3 pr-4 font-medium">Status</th>
-                <th className="pb-3 pr-4 font-medium">Triggered</th>
-                <th className="pb-3 pr-4 font-medium">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {alerts.slice(0, 3).map((alert) => (
-                <tr key={alert.id} className="border-b border-white/5 align-top">
-                  <td className="py-4 pr-4">
-                    <p className="font-medium text-white">{alert.title}</p>
-                    <p className="mt-1 max-w-md text-slate-400">{alert.message}</p>
-                  </td>
-                  <td className="py-4 pr-4">
-                    <SeverityBadge value={alert.priority} />
-                  </td>
-                  <td className="py-4 pr-4">
-                    <StatusBadge value={alert.status} />
-                  </td>
-                  <td className="py-4 pr-4 text-slate-400">
-                    {new Date(alert.created_at).toLocaleString()}
-                  </td>
-                  <td className="py-4 pr-0">
-                    <select
-                      value={alert.status}
-                      disabled={updatingId === alert.id}
-                      onChange={(event) => updateStatus(alert.id, event.target.value as AlertStatus)}
-                      className="rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none ring-0"
-                    >
-                      {statusOptions.map((status) => (
-                        <option key={status} value={status}>
-                          {status}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                </tr>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <KpiCard label="Open Alerts" value={String(openCount)} hint="active queue" tone={openCount > 0 ? "warning" : "success"} />
+        <KpiCard label="Acknowledged" value={String(acknowledgedCount)} hint="under review" />
+        <KpiCard label="Resolved" value={String(resolvedCount)} hint="closed incidents" tone={resolvedCount > 0 ? "success" : "default"} />
+        <KpiCard
+          label="Critical Alerts"
+          value={String(criticalCount)}
+          hint={lastSyncedAt ? `synced ${new Date(lastSyncedAt).toLocaleTimeString()}` : "awaiting sync"}
+          tone={criticalCount > 0 ? "danger" : "success"}
+        />
+      </div>
+
+      <div className="mt-6 flex flex-wrap gap-2">
+        {FILTERS.map((filter) => (
+          <button
+            key={filter.id}
+            type="button"
+            onClick={() => setActiveFilter(filter.id)}
+            className={`rounded-full px-4 py-2 text-sm font-medium transition ${
+              activeFilter === filter.id
+                ? "bg-cyan-400 text-slate-950"
+                : "border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
+            }`}
+          >
+            {filter.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-6 grid gap-6 xl:grid-cols-[1.5fr_1fr]">
+        <PanelCard title="Alert Queue" subtitle="Backend alerts from the waveform classifier and other connected alert sources are tracked here with real status updates.">
+          {filteredAlerts.length === 0 ? (
+            <p className="text-sm text-slate-400">No alerts match the current filter.</p>
+          ) : (
+            <div className="space-y-4">
+              {filteredAlerts.map((alert) => (
+                <div key={alert.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="font-medium text-white">{alert.title}</p>
+                      <p className="mt-1 text-sm text-slate-400">{alert.message}</p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <SeverityBadge value={alert.priority} />
+                      <StatusBadge value={alert.status} />
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 md:grid-cols-3">
+                    <div className="rounded-2xl bg-slate-950/60 p-4">
+                      <p className="text-xs font-medium text-slate-500">Triggered</p>
+                      <p className="mt-2 text-sm text-white">{alert.triggered_by}</p>
+                    </div>
+                    <div className="rounded-2xl bg-slate-950/60 p-4">
+                      <p className="text-xs font-medium text-slate-500">Created</p>
+                      <p className="mt-2 text-sm text-white">{new Date(alert.created_at).toLocaleString()}</p>
+                    </div>
+                    <div className="rounded-2xl bg-slate-950/60 p-4">
+                      <p className="text-xs font-medium text-slate-500">Status Action</p>
+                      <select
+                        value={alert.status}
+                        disabled={updatingId === alert.id}
+                        onChange={(event) => updateStatus(alert.id, event.target.value as AlertStatus)}
+                        className="mt-2 w-full rounded-xl border border-white/10 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none ring-0"
+                      >
+                        {statusOptions.map((status) => (
+                          <option key={status} value={status}>
+                            {status}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
               ))}
-            </tbody>
-          </table>
-        </div>
-      </PanelCard>
+            </div>
+          )}
+        </PanelCard>
+
+        <PanelCard title="Alert Guide" subtitle="Use this queue like an incident workspace in a production app.">
+          <div className="space-y-4 text-sm text-slate-300">
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <p className="font-medium text-white">Open</p>
+              <p className="mt-2">A new issue has been detected and still needs operator attention.</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <p className="font-medium text-white">Acknowledged</p>
+              <p className="mt-2">Someone has seen the alert and is actively reviewing or triaging it.</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <p className="font-medium text-white">Resolved</p>
+              <p className="mt-2">The disturbance or incident has been handled and the alert can stay in history.</p>
+            </div>
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <p className="font-medium text-white">Backend Sync</p>
+              <p className="mt-2">
+                This page reads from the backend alerts API and writes status changes back to the database, so it reflects the same queue other app surfaces can use.
+              </p>
+            </div>
+          </div>
+        </PanelCard>
+      </div>
     </AppShell>
   );
 }

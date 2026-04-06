@@ -224,6 +224,10 @@ export function WaveformClassifierCard() {
 
   const predictedDistribution = useMemo(() => {
     const counts = history.reduce<Record<string, number>>((acc, entry) => {
+      if (entry.predictedClass === INITIAL_SIMULATION_CLASS) {
+        return acc;
+      }
+
       acc[entry.predictedClass] = (acc[entry.predictedClass] ?? 0) + 1;
       return acc;
     }, {});
