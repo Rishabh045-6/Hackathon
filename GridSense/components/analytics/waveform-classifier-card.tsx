@@ -700,7 +700,7 @@ export function WaveformClassifierCard() {
                 <div>
                   <p className="text-sm font-medium text-white">Live Disturbance Stream</p>
                   <p className="mt-1 text-sm text-slate-400">
-                    Starts from a pure sinusoidal waveform, hits one random disturbance, returns to normal, and repeats every 7 seconds.
+                    Starts from a pure sinusoidal waveform.
                   </p>
                 </div>
                 <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium text-cyan-200">
