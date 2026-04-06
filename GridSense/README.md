@@ -294,13 +294,13 @@ The endpoint `POST /api/grid/predict` executes `scripts/classify_signal.py`, whi
 
 Expected file locations relative to this repo:
 - Model checkpoint:
-  - `../pytorch_cnn_outputs/cnn_model.pt`
+  - `./cnn_model.pt`
 - Waveform dataset directory (for `GET /api/grid/waveform`):
   - `../archive/XPQRS/*.csv`
 
 Important:
-- These paths resolve one level above this repository directory.
-- If your data lives elsewhere, either move it to these expected paths or update route/script path resolution.
+- The classifier now reads `PYTORCH_MODEL_PATH` and defaults to `./cnn_model.pt` in this workspace.
+- If you keep the older layout, the script also falls back to `../pytorch_cnn_outputs/cnn_model.pt`.
 
 ## Explanation Pipeline (LLM + Fallback)
 
@@ -348,7 +348,7 @@ curl -X PATCH http://localhost:3000/api/alerts \
   - Confirm Python is installed and accessible.
   - Set `PYTHON_EXECUTABLE` if needed (for example, venv path).
   - Install `numpy` and `torch`.
-  - Verify model exists at `../pytorch_cnn_outputs/cnn_model.pt`.
+  - Verify model exists at `./cnn_model.pt` or the legacy `../pytorch_cnn_outputs/cnn_model.pt` layout.
 
 - `GET /api/grid/waveform` fails:
   - Ensure CSV files exist at `../archive/XPQRS`.

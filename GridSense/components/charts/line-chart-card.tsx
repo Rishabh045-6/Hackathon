@@ -21,10 +21,12 @@ export function LineChartCard({
   data,
   xKey,
   series,
+  yAxisDomain,
 }: {
   data: Record<string, string | number>[];
   xKey: string;
   series: Series[];
+  yAxisDomain?: [number, number];
 }) {
   return (
     <div className="h-80">
@@ -32,7 +34,14 @@ export function LineChartCard({
         <LineChart data={data}>
           <CartesianGrid stroke="rgba(148,163,184,0.12)" vertical={false} />
           <XAxis dataKey={xKey} tick={{ fill: "#94a3b8", fontSize: 12 }} axisLine={false} tickLine={false} />
-          <YAxis tick={{ fill: "#94a3b8", fontSize: 12 }} axisLine={false} tickLine={false} />
+          <YAxis
+            type="number"
+            tick={{ fill: "#94a3b8", fontSize: 12 }}
+            axisLine={false}
+            tickLine={false}
+            allowDecimals={false}
+            domain={yAxisDomain}
+          />
           <Tooltip
             contentStyle={{
               background: "#020617",

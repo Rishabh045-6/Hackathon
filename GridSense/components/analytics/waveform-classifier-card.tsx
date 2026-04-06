@@ -231,7 +231,7 @@ export function WaveformClassifierCard() {
     () =>
       history.map((entry) => ({
         run: `Run ${entry.run}`,
-        confidence: Number((entry.confidence * 100).toFixed(2)),
+        confidence: entry.confidence * 100,
       })),
     [history],
   );
@@ -1105,6 +1105,7 @@ export function WaveformClassifierCard() {
                   data={confidenceTimeline}
                   xKey="run"
                   series={[{ dataKey: "confidence", name: "Confidence (%)", color: "#22d3ee" }]}
+                  yAxisDomain={[90, 100]}
                 />
               </div>
             )}

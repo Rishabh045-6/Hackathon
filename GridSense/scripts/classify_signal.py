@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -56,11 +57,28 @@ class PQCNN(nn.Module):
 
 
 def load_artifacts() -> tuple[nn.Module, list[str]]:
-    repo_root = Path(__file__).resolve().parents[2]
-    model_path = repo_root / "pytorch_cnn_outputs" / "cnn_model.pt"
+    repo_root = Path(__file__).resolve().parents[1]
+    model_path_value = os.environ.get("PYTORCH_MODEL_PATH", "cnn_model.pt").strip()
+    model_path = Path(model_path_value)
 
-    checkpoint = torch.load(model_path, map_location="cpu")
-    classes = checkpoint["classes"]
+    if not model_path.is_absolute():
+        model_path = repo_root / model_path
+
+    if not model_path.exists():
+        legacy_model_path = repo_root / "pytorch_cnn_outputs" / "cnn_model.pt"
+        if legacy_model_path.exists():
+            model_path = legacy_model_path
+
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+    if "classes" in checkpoint:
+        classes = [str(label) for label in checkpoint["classes"]]
+    else:
+        encoder = checkpoint.get("encoder")
+        if encoder is None or not hasattr(encoder, "classes_"):
+            raise KeyError("Checkpoint is missing class labels.")
+
+        classes = [str(label) for label in encoder.classes_.tolist()]
+
     model = PQCNN(n_classes=checkpoint["n_classes"])
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
