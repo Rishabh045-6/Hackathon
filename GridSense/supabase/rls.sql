@@ -1,6 +1,7 @@
 alter table public.profiles enable row level security;
 alter table public.grid_readings enable row level security;
 alter table public.predictions enable row level security;
+alter table public.prediction_logs enable row level security;
 alter table public.anomalies enable row level security;
 alter table public.alerts enable row level security;
 alter table public.app_settings enable row level security;
@@ -34,6 +35,19 @@ using (auth.role() = 'authenticated');
 drop policy if exists "predictions self write" on public.predictions;
 create policy "predictions self write"
 on public.predictions
+for all
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+drop policy if exists "prediction logs authenticated read" on public.prediction_logs;
+create policy "prediction logs authenticated read"
+on public.prediction_logs
+for select
+using (auth.role() = 'authenticated');
+
+drop policy if exists "prediction logs self write" on public.prediction_logs;
+create policy "prediction logs self write"
+on public.prediction_logs
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);

@@ -54,6 +54,23 @@ create table if not exists public.predictions (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.prediction_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  predicted_class text not null,
+  predicted_label integer not null,
+  confidence numeric(6,5) not null,
+  source_class text,
+  sample_index integer,
+  signal_preview jsonb,
+  signal_length integer not null default 100,
+  explanation_summary text,
+  model_name text not null default 'pytorch-cnn',
+  source_identifier text,
+  top_k jsonb not null default '[]'::jsonb,
+  created_at timestamptz not null default now()
+);
+
 create table if not exists public.anomalies (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
@@ -101,6 +118,9 @@ create index if not exists idx_grid_readings_user_recorded_at
 
 create index if not exists idx_predictions_user_predicted_for
   on public.predictions (user_id, predicted_for desc);
+
+create index if not exists idx_prediction_logs_user_created_at
+  on public.prediction_logs (user_id, created_at desc);
 
 create index if not exists idx_anomalies_user_detected_at
   on public.anomalies (user_id, detected_at desc);

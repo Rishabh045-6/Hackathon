@@ -39,6 +39,29 @@ export interface Prediction {
   created_at: string;
 }
 
+export interface PredictionLogEntry {
+  predicted_class: string;
+  predicted_label: number;
+  confidence: number;
+}
+
+export interface PredictionLog {
+  id: string;
+  user_id: string;
+  predicted_class: string;
+  predicted_label: number;
+  confidence: number;
+  source_class: string | null;
+  sample_index: number | null;
+  signal_preview: number[] | null;
+  signal_length: number;
+  explanation_summary: string | null;
+  model_name: string;
+  source_identifier: string | null;
+  top_k: PredictionLogEntry[];
+  created_at: string;
+}
+
 export interface Anomaly {
   id: string;
   user_id: string;
@@ -109,4 +132,18 @@ export interface AlertCandidate {
   priority: Severity;
   anomaly_id: string | null;
   triggered_by: string;
+}
+
+export interface PredictionLogInsert {
+  predicted_class: string;
+  predicted_label: number;
+  confidence: number;
+  source_class?: string | null;
+  sample_index?: number | null;
+  signal_preview?: number[] | null;
+  signal_length: number;
+  explanation_summary?: string | null;
+  model_name: string;
+  source_identifier?: string | null;
+  top_k: PredictionLogEntry[];
 }

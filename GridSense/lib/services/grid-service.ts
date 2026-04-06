@@ -7,6 +7,8 @@ import type {
   GridReading,
   GridStatus,
   Prediction,
+  PredictionLog,
+  PredictionLogInsert,
   ReadingSource,
   ServiceResult,
   SimulatedReadingInput,
@@ -27,6 +29,10 @@ type NumericReadingRow = Omit<
 
 type NumericPredictionRow = Omit<Prediction, "predicted_load" | "confidence"> & {
   predicted_load: number | string;
+  confidence: number | string;
+};
+
+type NumericPredictionLogRow = Omit<PredictionLog, "confidence"> & {
   confidence: number | string;
 };
 
@@ -59,6 +65,26 @@ function mapPrediction(row: NumericPredictionRow): Prediction {
     ...row,
     predicted_load: toNumber(row.predicted_load),
     confidence: toNumber(row.confidence),
+  };
+}
+
+function mapPredictionLog(row: NumericPredictionLogRow): PredictionLog {
+  return {
+    ...row,
+    confidence: toNumber(row.confidence),
+    predicted_label: Number(row.predicted_label),
+    sample_index: row.sample_index === null ? null : Number(row.sample_index),
+    signal_length: Number(row.signal_length),
+    signal_preview: Array.isArray(row.signal_preview)
+      ? row.signal_preview.map((value) => Number(value))
+      : null,
+    top_k: Array.isArray(row.top_k)
+      ? row.top_k.map((item) => ({
+          predicted_class: String(item.predicted_class),
+          predicted_label: Number(item.predicted_label),
+          confidence: toNumber(item.confidence),
+        }))
+      : [],
   };
 }
 
@@ -327,6 +353,72 @@ export async function getPredictions(
 
   return {
     data: ((insertResult.data ?? []) as NumericPredictionRow[]).map(mapPrediction),
+    error: null,
+  };
+}
+
+export async function getPredictionLogs(
+  supabase: SupabaseClient,
+  limit = DEFAULT_LIMIT,
+): Promise<ServiceResult<PredictionLog[]>> {
+  const userResult = await getCurrentUserId(supabase);
+
+  if (userResult.error) {
+    return { data: [], error: userResult.error };
+  }
+
+  const { data, error } = await supabase
+    .from("prediction_logs")
+    .select("*")
+    .eq("user_id", userResult.data)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    return { data: [], error: error.message };
+  }
+
+  return {
+    data: ((data ?? []) as NumericPredictionLogRow[]).map(mapPredictionLog),
+    error: null,
+  };
+}
+
+export async function createPredictionLog(
+  supabase: SupabaseClient,
+  input: PredictionLogInsert,
+): Promise<ServiceResult<PredictionLog | null>> {
+  const userResult = await getCurrentUserId(supabase);
+
+  if (userResult.error) {
+    return { data: null, error: userResult.error };
+  }
+
+  const { data, error } = await supabase
+    .from("prediction_logs")
+    .insert({
+      user_id: userResult.data,
+      predicted_class: input.predicted_class,
+      predicted_label: input.predicted_label,
+      confidence: input.confidence,
+      source_class: input.source_class ?? null,
+      sample_index: input.sample_index ?? null,
+      signal_preview: input.signal_preview ?? null,
+      signal_length: input.signal_length,
+      explanation_summary: input.explanation_summary ?? null,
+      model_name: input.model_name,
+      source_identifier: input.source_identifier ?? null,
+      top_k: input.top_k,
+    })
+    .select("*")
+    .single();
+
+  if (error) {
+    return { data: null, error: error.message };
+  }
+
+  return {
+    data: mapPredictionLog(data as NumericPredictionLogRow),
     error: null,
   };
 }

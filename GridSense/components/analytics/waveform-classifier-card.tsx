@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { BarChartCard } from "@/components/charts/bar-chart-card";
 import { LineChartCard } from "@/components/charts/line-chart-card";
@@ -42,6 +43,7 @@ type WaveformSample = {
 };
 
 type SimulationMode = "single" | "all";
+type LiveStreamPhase = "normal" | "disturbance";
 
 type SimulationHistoryEntry = {
   run: number;
@@ -58,6 +60,9 @@ type SimulationHistoryEntry = {
   explanation: OperationalExplanation;
 };
 
+const CONFIDENCE_THRESHOLD = 0.9;
+const LIVE_STREAM_INTERVAL_MS = 7_000;
+const INITIAL_SIMULATION_CLASS = "Pure_Sinusoidal";
 const EXPLANATION_MIN_REQUEST_GAP_MS = 15_000;
 
 function computeSignalMetrics(values: number[]) {
@@ -132,6 +137,10 @@ function parseSignalInput(raw: string): number[] {
   return values;
 }
 
+function getNormalClass(classes: string[]) {
+  return classes.includes(INITIAL_SIMULATION_CLASS) ? INITIAL_SIMULATION_CLASS : (classes[0] ?? "");
+}
+
 export function WaveformClassifierCard() {
   const [inputValue, setInputValue] = useState("");
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -144,8 +153,11 @@ export function WaveformClassifierCard() {
   const [simulationInfo, setSimulationInfo] = useState<WaveformSample | null>(null);
   const [history, setHistory] = useState<SimulationHistoryEntry[]>([]);
   const [expandedRuns, setExpandedRuns] = useState<number[]>([]);
-  const [autoplay, setAutoplay] = useState(false);
+  const [autoplay, setAutoplay] = useState(true);
+  const [liveStreamPhase, setLiveStreamPhase] = useState<LiveStreamPhase>("disturbance");
+  const [liveSourceClass, setLiveSourceClass] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [confidenceGateMessage, setConfidenceGateMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [explanationLoading, setExplanationLoading] = useState(false);
   const [manualModeOpen, setManualModeOpen] = useState(false);
@@ -159,6 +171,7 @@ export function WaveformClassifierCard() {
   } | null>(null);
   const lastExplanationRequestRef = useRef<{ key: string; at: number } | null>(null);
   const explanationRequestInFlightRef = useRef<string | null>(null);
+  const liveStreamPhaseRef = useRef<LiveStreamPhase>("disturbance");
 
   const severityStyle = useMemo(
     () => getSeverityStyle(result?.predicted_label ?? null),
@@ -264,7 +277,11 @@ export function WaveformClassifierCard() {
         }
 
         setDatasetMeta(json.data);
-        setSelectedClass(json.data.classes[0] ?? "");
+        setSelectedClass(
+          json.data.classes.includes(INITIAL_SIMULATION_CLASS)
+            ? INITIAL_SIMULATION_CLASS
+            : (json.data.classes[0] ?? ""),
+        );
       } catch (metaError) {
         setError(metaError instanceof Error ? metaError.message : "Failed to load waveform dataset.");
       }
@@ -274,12 +291,21 @@ export function WaveformClassifierCard() {
   }, []);
 
   useEffect(() => {
-    if (simulationMode !== "all") {
+    if (simulationMode !== "all" || !datasetMeta) {
       return;
     }
 
-    void loadWaveform({ mode: "all" });
-  }, [simulationMode]);
+    const initialClass = getNormalClass(datasetMeta.classes);
+
+    if (!initialClass) {
+      return;
+    }
+
+    liveStreamPhaseRef.current = "disturbance";
+    setLiveStreamPhase("disturbance");
+    setLiveSourceClass(initialClass);
+    void loadWaveform({ mode: "single", className: initialClass, sampleIndex: 0 });
+  }, [datasetMeta, simulationMode]);
 
   useEffect(() => {
     if (simulationMode !== "single" || !selectedClass) {
@@ -321,7 +347,7 @@ export function WaveformClassifierCard() {
 
     const timer = window.setTimeout(() => {
       if (simulationMode === "all") {
-        void loadWaveform({ mode: "all" });
+        void loadNextLiveStreamWaveform();
         return;
       }
 
@@ -329,7 +355,7 @@ export function WaveformClassifierCard() {
       const nextIndex =
         simulationInfo ? (simulationInfo.sampleIndex + 1) % total : (selectedIndex + 1) % total;
       void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: nextIndex });
-    }, 6000);
+    }, LIVE_STREAM_INTERVAL_MS);
 
     return () => window.clearTimeout(timer);
   }, [
@@ -342,12 +368,42 @@ export function WaveformClassifierCard() {
     datasetMeta?.samplesPerClass,
   ]);
 
+  async function loadNextLiveStreamWaveform() {
+    if (!datasetMeta) {
+      return;
+    }
+
+    const normalClass = getNormalClass(datasetMeta.classes);
+
+    if (!normalClass) {
+      return;
+    }
+
+    if (liveStreamPhaseRef.current === "disturbance") {
+      const disturbanceClasses = datasetMeta.classes.filter((className) => className !== normalClass);
+      const nextDisturbanceClass =
+        disturbanceClasses[Math.floor(Math.random() * disturbanceClasses.length)] ?? normalClass;
+
+      liveStreamPhaseRef.current = "normal";
+      setLiveStreamPhase("normal");
+      setLiveSourceClass(nextDisturbanceClass);
+      await loadWaveform({ mode: "single", className: nextDisturbanceClass, random: true });
+      return;
+    }
+
+    liveStreamPhaseRef.current = "disturbance";
+    setLiveStreamPhase("disturbance");
+    setLiveSourceClass(normalClass);
+    await loadWaveform({ mode: "single", className: normalClass, random: true });
+  }
+
   function handleTextParse(raw: string) {
     const parsed = parseSignalInput(raw);
     setInputValue(raw);
     setSignal(parsed);
     setSelectedFile(null);
     setError(null);
+    setConfidenceGateMessage(null);
     setResult(null);
   }
 
@@ -364,6 +420,7 @@ export function WaveformClassifierCard() {
       setSignal(parsed);
       setSelectedFile(file.name);
       setError(null);
+      setConfidenceGateMessage(null);
       setResult(null);
     } catch (uploadError) {
       setSignal(null);
@@ -456,11 +513,17 @@ export function WaveformClassifierCard() {
     try {
       setLoading(true);
       setError(null);
+      setConfidenceGateMessage(null);
 
       const response = await fetch("/api/grid/predict", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ signal: nextSignal }),
+        body: JSON.stringify({
+          signal: nextSignal,
+          source_class: sourceClass === "Manual" ? null : sourceClass,
+          sample_index: sourceClass === "Manual" ? null : sourceIndex,
+          source_identifier: sourceClass === "Manual" ? "manual-waveform" : "waveform-simulation",
+        }),
       });
 
       const json = (await response.json()) as ApiResponse<ClassifierResponse | null>;
@@ -469,6 +532,13 @@ export function WaveformClassifierCard() {
       }
 
       const resultData = json.data;
+      if (resultData.confidence < CONFIDENCE_THRESHOLD) {
+        setResult(null);
+        setExplanation(null);
+        setConfidenceGateMessage("Confidence is below 90%, so the result is hidden until the model is more certain.");
+        return;
+      }
+
       const nextExplanation = getClassifierExplanation(resultData.predicted_label);
       const isCorrect = resultData.predicted_class === sourceClass;
       const explanationPayload: ExplanationRequestPayload = {
@@ -490,6 +560,7 @@ export function WaveformClassifierCard() {
       const lastExplanationMeta = lastExplanationMetaRef.current;
 
       setResult(resultData);
+      setConfidenceGateMessage(null);
 
       if (
         lastExplanationMeta &&
@@ -604,7 +675,9 @@ export function WaveformClassifierCard() {
       setInputValue(sample.signal.join(", "));
       setSimulationInfo(sample);
       setSelectedIndex(sample.sampleIndex);
+      setLiveSourceClass(sample.className);
       setSelectedFile(null);
+      setConfidenceGateMessage(null);
       await classifySignal(sample.signal, sample.className, sample.sampleIndex);
     } catch (waveformError) {
       setLoading(false);
@@ -627,23 +700,23 @@ export function WaveformClassifierCard() {
                 <div>
                   <p className="text-sm font-medium text-white">Live Disturbance Stream</p>
                   <p className="mt-1 text-sm text-slate-400">
-                    Random waveform simulation across the full 17-class dataset, streamed as one AI-driven demo feed.
+                    Starts from a pure sinusoidal waveform, hits one random disturbance, returns to normal, and repeats every 7 seconds.
                   </p>
                 </div>
                 <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium text-cyan-200">
-                  All classes live
+                  Normal / disturbance cycle
                 </span>
               </div>
             </div>
 
             <p className="mt-4 text-sm text-slate-400">
-              The stream keeps sampling from the full dataset and turns each waveform into live telemetry, AI prediction, explanation, and chart updates.
+              The stream now alternates between a normal waveform and a randomly selected disturbance for telemetry, confident AI predictions, explanations, and chart updates.
             </p>
 
             <div className="mt-4 flex flex-wrap gap-3">
               <button
                 type="button"
-                onClick={() => void loadWaveform({ mode: "all" })}
+                onClick={() => void loadNextLiveStreamWaveform()}
                 disabled={loading}
                 className="rounded-full bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 transition disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -652,7 +725,22 @@ export function WaveformClassifierCard() {
 
               <button
                 type="button"
-                onClick={() => void loadWaveform({ mode: "all" })}
+                onClick={() => {
+                  liveStreamPhaseRef.current = "disturbance";
+                  setLiveStreamPhase("disturbance");
+                  if (!datasetMeta) {
+                    return;
+                  }
+
+                  const normalClass = getNormalClass(datasetMeta.classes);
+
+                  if (!normalClass) {
+                    return;
+                  }
+
+                  setLiveSourceClass(normalClass);
+                  void loadWaveform({ mode: "single", className: normalClass, sampleIndex: 0 });
+                }}
                 disabled={loading}
                 className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
               >
@@ -671,6 +759,7 @@ export function WaveformClassifierCard() {
             <div className="mt-4 flex flex-wrap items-center gap-3 text-xs uppercase tracking-[0.16em] text-slate-500">
               <span>{signal ? "100-point waveform loaded" : "Waiting for waveform sample"}</span>
               <span>mode: live dataset stream</span>
+              {liveSourceClass ? <span>source: {liveSourceClass}</span> : null}
               {selectedFile ? <span>manual file: {selectedFile}</span> : null}
             </div>
 
@@ -728,7 +817,11 @@ export function WaveformClassifierCard() {
                   </p>
                 ) : (
                   <div className="mt-4 space-y-4">
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                        <p className="text-xs font-medium text-slate-500">Source class</p>
+                        <p className="mt-2 text-sm font-semibold text-white">{liveSourceClass ?? "--"}</p>
+                      </div>
                       <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
                         <p className="text-xs font-medium text-slate-500">Current sample</p>
                         <p className="mt-2 text-xl font-semibold text-white">
@@ -859,10 +952,19 @@ export function WaveformClassifierCard() {
 
         <div className="space-y-4">
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-            <p className="text-sm font-medium text-white">Result</p>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-medium text-white">Result</p>
+              <Link
+                href="/logs"
+                className="rounded-full border border-white/10 bg-slate-950/60 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10"
+              >
+                Open Logs
+              </Link>
+            </div>
             {!result ? (
               <p className="mt-3 text-sm text-slate-400">
-                Start the waveform simulation to see the predicted disturbance class, confidence, and top matches.
+                {confidenceGateMessage ??
+                  "Start the waveform simulation to see the predicted disturbance class, confidence, and top matches."}
               </p>
             ) : (
               <div className="mt-4 space-y-4">
