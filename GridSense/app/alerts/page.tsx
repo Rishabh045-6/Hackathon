@@ -4,94 +4,57 @@ import { useEffect, useState } from "react";
 import { PanelCard } from "@/components/dashboard/panel-card";
 import { SeverityBadge, StatusBadge } from "@/components/dashboard/status-badge";
 import { AppShell } from "@/components/layout/app-shell";
-import { StatePanel } from "@/components/layout/state-panel";
+import { createAlert } from "@/lib/live-sim";
 import type { Alert, AlertStatus } from "@/types/grid";
-
-type ApiResponse<T> = {
-  ok: boolean;
-  data: T;
-  error: string | null;
-};
 
 const statusOptions: AlertStatus[] = ["open", "acknowledged", "resolved"];
 
+function randomPriority(): Alert["priority"] {
+  const roll = Math.random();
+  if (roll > 0.82) return "high";
+  if (roll > 0.45) return "medium";
+  return "low";
+}
+
 export default function AlertsPage() {
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [alerts, setAlerts] = useState<Alert[]>(() =>
+    Array.from({ length: 8 }, (_, index) =>
+      createAlert(randomPriority(), "live-alerts-simulator", `alert stream ${index + 1}`),
+    ),
+  );
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
-  async function loadAlerts() {
-    try {
-      setLoading(true);
-      setError(null);
-
-      const response = await fetch("/api/alerts?limit=50", { cache: "no-store" });
-      const json = (await response.json()) as ApiResponse<Alert[]>;
-
-      if (!json.ok) {
-        throw new Error(json.error ?? "Failed to load alerts.");
-      }
-
-      setAlerts(json.data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to load alerts.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
   useEffect(() => {
-    loadAlerts();
+    const timer = window.setInterval(() => {
+      setAlerts((current) => {
+        const priority = randomPriority();
+        const nextAlert = createAlert(priority, "live-alerts-simulator", "alert stream event");
+
+        return [nextAlert, ...current].slice(0, 5);
+      });
+    }, 3500);
+
+    return () => window.clearInterval(timer);
   }, []);
 
   async function updateStatus(alertId: string, status: AlertStatus) {
     try {
       setUpdatingId(alertId);
-      setError(null);
-
-      const response = await fetch("/api/alerts", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ alertId, status }),
-      });
-
-      const json = (await response.json()) as ApiResponse<Alert | null>;
-
-      if (!json.ok || !json.data) {
-        throw new Error(json.error ?? "Failed to update alert.");
-      }
-
       setAlerts((current) =>
-        current.map((alert) => (alert.id === alertId ? json.data ?? alert : alert)),
+        current.map((alert) => (alert.id === alertId ? { ...alert, status } : alert)),
       );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to update alert.");
     } finally {
       setUpdatingId(null);
     }
   }
 
-  if (loading) {
-    return (
-      <AppShell title="Alerts" subtitle="Operational events and response workflow.">
-        <StatePanel title="Loading alerts" message="Fetching current alert queue." />
-      </AppShell>
-    );
-  }
-
-  if (error && alerts.length === 0) {
-    return (
-      <AppShell title="Alerts" subtitle="Operational events and response workflow.">
-        <StatePanel title="Unable to load alerts" message={error} />
-      </AppShell>
-    );
-  }
-
   if (alerts.length === 0) {
     return (
       <AppShell title="Alerts" subtitle="Operational events and response workflow.">
-        <StatePanel title="No alerts found" message="The system has not generated any alerts yet." />
+        <div className="rounded-3xl border border-dashed border-white/10 bg-white/5 p-8 text-center">
+          <h2 className="text-lg font-semibold text-white">No alerts found</h2>
+          <p className="mt-2 text-sm text-slate-400">The live simulation has not generated any alerts yet.</p>
+        </div>
       </AppShell>
     );
   }
@@ -99,8 +62,6 @@ export default function AlertsPage() {
   return (
     <AppShell title="Alerts" subtitle="Operational events and response workflow.">
       <PanelCard title="Alert Queue" subtitle="Review and update alert status">
-        {error ? <p className="mb-4 text-sm text-rose-300">{error}</p> : null}
-
         <div className="overflow-x-auto">
           <table className="min-w-full text-left text-sm">
             <thead className="text-slate-400">
@@ -113,7 +74,7 @@ export default function AlertsPage() {
               </tr>
             </thead>
             <tbody>
-              {alerts.map((alert) => (
+              {alerts.slice(0, 5).map((alert) => (
                 <tr key={alert.id} className="border-b border-white/5 align-top">
                   <td className="py-4 pr-4">
                     <p className="font-medium text-white">{alert.title}</p>

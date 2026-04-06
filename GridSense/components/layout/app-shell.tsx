@@ -23,7 +23,7 @@ export function AppShell({
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
-      <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-[1600px] px-4 py-8 sm:px-6 xl:px-8 2xl:px-10">
         <div className="mb-8 flex flex-col gap-5 rounded-3xl border border-white/10 bg-white/5 p-6 shadow-2xl shadow-slate-950/40">
           <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div>

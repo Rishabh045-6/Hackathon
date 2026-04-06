@@ -1,10 +1,15 @@
 "use client";
 
-import { ChangeEvent, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { BarChartCard } from "@/components/charts/bar-chart-card";
 import { LineChartCard } from "@/components/charts/line-chart-card";
 import { PanelCard } from "@/components/dashboard/panel-card";
-import { getClassifierExplanation } from "@/lib/classifier-explanations";
+import {
+  buildFallbackOperationalExplanation,
+  getClassifierExplanation,
+  type ExplanationRequestPayload,
+  type OperationalExplanation,
+} from "@/lib/classifier-explanations";
 
 type ClassifierResponse = {
   predicted_class: string;
@@ -50,8 +55,25 @@ type SimulationHistoryEntry = {
   severity: "low" | "medium" | "high";
   isCorrect: boolean;
   timestamp: string;
-  explanation: ReturnType<typeof getClassifierExplanation>;
+  explanation: OperationalExplanation;
 };
+
+function computeSignalMetrics(values: number[]) {
+  if (values.length === 0) {
+    return { rms: 0, peak: 0, trough: 0, mean: 0 };
+  }
+
+  const peak = Math.max(...values);
+  const trough = Math.min(...values);
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const rms = Math.sqrt(values.reduce((sum, value) => sum + value ** 2, 0) / values.length);
+
+  return { rms, peak, trough, mean };
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
 
 function getSeverityStyle(predictedLabel: number | null) {
   if (predictedLabel === null) {
@@ -114,23 +136,25 @@ export function WaveformClassifierCard() {
   const [signal, setSignal] = useState<number[] | null>(null);
   const [result, setResult] = useState<ClassifierResponse | null>(null);
   const [datasetMeta, setDatasetMeta] = useState<DatasetMeta | null>(null);
-  const [simulationMode, setSimulationMode] = useState<SimulationMode>("single");
+  const [simulationMode, setSimulationMode] = useState<SimulationMode>("all");
   const [selectedClass, setSelectedClass] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [simulationInfo, setSimulationInfo] = useState<WaveformSample | null>(null);
   const [history, setHistory] = useState<SimulationHistoryEntry[]>([]);
-  const [selectedRun, setSelectedRun] = useState<number | null>(null);
+  const [expandedRuns, setExpandedRuns] = useState<number[]>([]);
   const [autoplay, setAutoplay] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [explanationLoading, setExplanationLoading] = useState(false);
   const [manualModeOpen, setManualModeOpen] = useState(false);
-
-  const explanation = useMemo(() => {
-    if (!result) {
-      return null;
-    }
-    return getClassifierExplanation(result.predicted_label);
-  }, [result]);
+  const [explanation, setExplanation] = useState<OperationalExplanation | null>(null);
+  const [playbackIndex, setPlaybackIndex] = useState(0);
+  const lastExplanationMetaRef = useRef<{
+    key: string;
+    source: "llm" | "fallback";
+    at: number;
+    explanation: OperationalExplanation;
+  } | null>(null);
 
   const severityStyle = useMemo(
     () => getSeverityStyle(result?.predicted_label ?? null),
@@ -144,6 +168,23 @@ export function WaveformClassifierCard() {
         amplitude: Number(value.toFixed(6)),
       })),
     [signal],
+  );
+  const disturbanceStreamData = useMemo(() => {
+    const recentSignals = history.slice(-4);
+    let offset = 0;
+
+    return recentSignals.flatMap((entry) => {
+      const points = entry.signal.map((value, index) => ({
+        sample: offset + index,
+        amplitude: Number(value.toFixed(6)),
+      }));
+      offset += entry.signal.length;
+      return points;
+    });
+  }, [history]);
+  const liveWaveformPreview = useMemo(
+    () => waveformPreview.slice(0, playbackIndex + 1),
+    [waveformPreview, playbackIndex],
   );
 
   const topProbabilityData = useMemo(
@@ -173,26 +214,41 @@ export function WaveformClassifierCard() {
     return Object.entries(counts).map(([className, count]) => ({ className, count }));
   }, [history]);
 
-  const severityDistribution = useMemo(() => {
-    const counts = history.reduce<Record<string, number>>((acc, entry) => {
-      acc[entry.severity] = (acc[entry.severity] ?? 0) + 1;
-      return acc;
-    }, {});
-
-    return Object.entries(counts).map(([name, value]) => ({ name, value }));
-  }, [history]);
-
   const sessionSummary = useMemo(() => {
     const samplesShown = history.length;
-    const correctPredictions = history.filter((entry) => entry.isCorrect).length;
-    const sessionAccuracy = samplesShown === 0 ? 0 : (correctPredictions / samplesShown) * 100;
+    const averageConfidence =
+      samplesShown === 0
+        ? 0
+        : history.reduce((sum, entry) => sum + entry.confidence, 0) / samplesShown;
 
     return {
       samplesShown,
-      correctPredictions,
-      sessionAccuracy: Number(sessionAccuracy.toFixed(2)),
+      averageConfidence: Number((averageConfidence * 100).toFixed(2)),
     };
   }, [history]);
+  const currentSampleValue = signal?.[playbackIndex] ?? null;
+  const processedSamples = signal ? Math.min(playbackIndex + 1, signal.length) : 0;
+  const playbackProgress = signal?.length ? (processedSamples / signal.length) * 100 : 0;
+  const liveMetrics = useMemo(
+    () => computeSignalMetrics((signal ?? []).slice(0, processedSamples)),
+    [signal, processedSamples],
+  );
+  const liveTelemetry = useMemo(() => {
+    const currentValue = currentSampleValue ?? 0;
+    const voltage = 230 + currentValue * 28;
+    const current = 14 + Math.abs(currentValue) * 11;
+    const frequency = 50 + liveMetrics.mean * 0.35;
+    const load = 18 + liveMetrics.rms * 10;
+    const powerFactor = 0.98 - Math.min(0.18, Math.abs(liveMetrics.peak - liveMetrics.trough) * 0.04);
+
+    return {
+      voltage: clamp(voltage, 180, 280),
+      current: clamp(current, 0, 60),
+      frequency: clamp(frequency, 48.5, 51.5),
+      load: clamp(load, 0, 100),
+      powerFactor: clamp(powerFactor, 0.7, 1),
+    };
+  }, [currentSampleValue, liveMetrics]);
 
   useEffect(() => {
     async function loadDatasetMeta() {
@@ -214,12 +270,41 @@ export function WaveformClassifierCard() {
   }, []);
 
   useEffect(() => {
+    if (simulationMode !== "all") {
+      return;
+    }
+
+    void loadWaveform({ mode: "all" });
+  }, [simulationMode]);
+
+  useEffect(() => {
     if (simulationMode !== "single" || !selectedClass) {
       return;
     }
 
     void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: 0 });
   }, [selectedClass, simulationMode]);
+
+  useEffect(() => {
+    if (!signal?.length) {
+      setPlaybackIndex(0);
+      return;
+    }
+
+    setPlaybackIndex(0);
+    const timer = window.setInterval(() => {
+      setPlaybackIndex((current) => {
+        if (current >= signal.length - 1) {
+          window.clearInterval(timer);
+          return current;
+        }
+
+        return current + 1;
+      });
+    }, 20);
+
+    return () => window.clearInterval(timer);
+  }, [signal]);
 
   useEffect(() => {
     if (!autoplay || loading) {
@@ -240,7 +325,7 @@ export function WaveformClassifierCard() {
       const nextIndex =
         simulationInfo ? (simulationInfo.sampleIndex + 1) % total : (selectedIndex + 1) % total;
       void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: nextIndex });
-    }, 2500);
+    }, 6000);
 
     return () => window.clearTimeout(timer);
   }, [
@@ -286,11 +371,69 @@ export function WaveformClassifierCard() {
     }
   }
 
+  async function requestExplanation(
+    payload: ExplanationRequestPayload,
+  ): Promise<OperationalExplanation> {
+    const fallback = buildFallbackOperationalExplanation(payload);
+
+    try {
+      setExplanationLoading(true);
+      const response = await fetch("/api/grid/explain", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const json = (await response.json()) as ApiResponse<OperationalExplanation | null>;
+      if (!response.ok || !json.ok || !json.data) {
+        return fallback;
+      }
+
+      return json.data;
+    } catch {
+      return fallback;
+    } finally {
+      setExplanationLoading(false);
+    }
+  }
+
+  function applyResolvedExplanation(
+    resolvedExplanation: OperationalExplanation,
+    resultData: ClassifierResponse,
+    sourceClass: string,
+    sourceIndex: number,
+    nextSignal: number[],
+    severity: "low" | "medium" | "high",
+    isCorrect: boolean,
+  ) {
+    setExplanation(resolvedExplanation);
+    setHistory((current) => {
+      const entry: SimulationHistoryEntry = {
+        run: current.length + 1,
+        sourceClass,
+        sourceIndex,
+        signal: nextSignal,
+        predictedLabel: resultData.predicted_label,
+        predictedClass: resultData.predicted_class,
+        confidence: resultData.confidence,
+        topK: resultData.top_k,
+        severity,
+        isCorrect,
+        timestamp: new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+        explanation: resolvedExplanation,
+      };
+      return [...current.slice(-11), entry];
+    });
+  }
+
   async function classifySignal(nextSignal: number[], sourceClass: string, sourceIndex: number) {
     try {
       setLoading(true);
       setError(null);
-      setResult(null);
 
       const response = await fetch("/api/grid/predict", {
         method: "POST",
@@ -306,30 +449,96 @@ export function WaveformClassifierCard() {
       const resultData = json.data;
       const nextExplanation = getClassifierExplanation(resultData.predicted_label);
       const isCorrect = resultData.predicted_class === sourceClass;
+      const explanationPayload: ExplanationRequestPayload = {
+        predicted_label: resultData.predicted_label,
+        predicted_class: resultData.predicted_class,
+        confidence: resultData.confidence,
+        top_k: resultData.top_k,
+        severity: nextExplanation.severity,
+        source_class: sourceClass,
+        source_row: sourceIndex,
+        is_correct: sourceClass === "Manual" ? null : isCorrect,
+      };
+      const explanationKey = JSON.stringify({
+        predicted_label: explanationPayload.predicted_label,
+        severity: explanationPayload.severity,
+        top_k: explanationPayload.top_k.map((item) => item.predicted_label),
+      });
+      const now = Date.now();
+      const lastExplanationMeta = lastExplanationMetaRef.current;
+
       setResult(resultData);
-      setHistory((current) => {
-        const entry: SimulationHistoryEntry = {
-          run: current.length + 1,
+
+      if (
+        lastExplanationMeta &&
+        lastExplanationMeta.key === explanationKey &&
+        lastExplanationMeta.source === "llm" &&
+        now - lastExplanationMeta.at < 60_000
+      ) {
+        applyResolvedExplanation(
+          lastExplanationMeta.explanation,
+          resultData,
           sourceClass,
           sourceIndex,
-          signal: nextSignal,
-          predictedLabel: resultData.predicted_label,
-          predictedClass: resultData.predicted_class,
-          confidence: resultData.confidence,
-          topK: resultData.top_k,
-          severity: nextExplanation.severity,
+          nextSignal,
+          nextExplanation.severity,
           isCorrect,
-          timestamp: new Date().toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          }),
-          explanation: nextExplanation,
-        };
-        const nextHistory = [...current.slice(-11), entry];
-        setSelectedRun(entry.run);
-        return nextHistory;
-      });
+        );
+      } else if (
+        lastExplanationMeta &&
+        lastExplanationMeta.key === explanationKey &&
+        lastExplanationMeta.source === "fallback" &&
+        now - lastExplanationMeta.at < 90_000
+      ) {
+        applyResolvedExplanation(
+          lastExplanationMeta.explanation,
+          resultData,
+          sourceClass,
+          sourceIndex,
+          nextSignal,
+          nextExplanation.severity,
+          isCorrect,
+        );
+      } else {
+        const localFallback = buildFallbackOperationalExplanation(explanationPayload);
+        applyResolvedExplanation(
+          localFallback,
+          resultData,
+          sourceClass,
+          sourceIndex,
+          nextSignal,
+          nextExplanation.severity,
+          isCorrect,
+        );
+
+        void requestExplanation(explanationPayload).then((resolvedExplanation) => {
+          lastExplanationMetaRef.current = {
+            key: explanationKey,
+            source: resolvedExplanation.source,
+            at: Date.now(),
+            explanation: resolvedExplanation,
+          };
+          setExplanation(resolvedExplanation);
+          setHistory((current) => {
+            if (current.length === 0) {
+              return current;
+            }
+
+            const nextHistory = [...current];
+            const lastEntry = nextHistory[nextHistory.length - 1];
+            if (
+              lastEntry.predictedLabel === resultData.predicted_label &&
+              lastEntry.sourceIndex === sourceIndex
+            ) {
+              nextHistory[nextHistory.length - 1] = {
+                ...lastEntry,
+                explanation: resolvedExplanation,
+              };
+            }
+            return nextHistory;
+          });
+        });
+      }
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "Classification failed.");
     } finally {
@@ -374,10 +583,6 @@ export function WaveformClassifierCard() {
       setSimulationInfo(sample);
       setSelectedIndex(sample.sampleIndex);
       setSelectedFile(null);
-      if (mode === "all") {
-        setSelectedClass(sample.className);
-      }
-
       await classifySignal(sample.signal, sample.className, sample.sampleIndex);
     } catch (waveformError) {
       setLoading(false);
@@ -386,211 +591,176 @@ export function WaveformClassifierCard() {
   }
 
   const latestHistoryEntry = history[history.length - 1] ?? null;
-  const selectedHistoryEntry =
-    history.find((entry) => entry.run === selectedRun) ?? latestHistoryEntry ?? null;
-  const selectedHistoryWaveform = useMemo(
-    () =>
-      (selectedHistoryEntry?.signal ?? []).map((value, index) => ({
-        sample: index,
-        amplitude: Number(value.toFixed(6)),
-      })),
-    [selectedHistoryEntry],
-  );
-  const selectedHistoryTopK = useMemo(
-    () =>
-      (selectedHistoryEntry?.topK ?? []).map((item) => ({
-        className: item.predicted_class,
-        confidence: Number((item.confidence * 100).toFixed(2)),
-      })),
-    [selectedHistoryEntry],
-  );
 
   return (
     <PanelCard
       title="Waveform Classifier"
       subtitle="Run live disturbance simulation from the 17-class waveform dataset and inspect classifier behavior in real time."
     >
-      <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
+      <div className="grid gap-6 xl:grid-cols-2">
         <div className="space-y-4">
           <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-4">
-            <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
-              <p className="text-sm font-medium text-white">Simulation Mode</p>
-              <div className="mt-3 flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAutoplay(false);
-                    setSimulationMode("single");
-                  }}
-                  className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                    simulationMode === "single"
-                      ? "bg-cyan-400 text-slate-950"
-                      : "border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
-                  }`}
-                >
-                  Single Class Mode
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAutoplay(false);
-                    setSimulationMode("all");
-                  }}
-                  className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                    simulationMode === "all"
-                      ? "bg-cyan-400 text-slate-950"
-                      : "border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
-                  }`}
-                >
-                  All Classes Random Demo
-                </button>
-              </div>
-            </div>
-
-            <div className="mt-4 grid gap-4 md:grid-cols-[1fr_auto]">
-              <div>
-                <label htmlFor="simulation-class" className="text-sm font-medium text-white">
-                  Simulation Class
-                </label>
-                <select
-                  id="simulation-class"
-                  value={selectedClass}
-                  onChange={(event) => {
-                    setAutoplay(false);
-                    setSelectedClass(event.target.value);
-                  }}
-                  disabled={simulationMode === "all"}
-                  className="mt-3 w-full rounded-2xl border border-white/10 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {(datasetMeta?.classes ?? []).map((className) => (
-                    <option key={className} value={className}>
-                      {className}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label htmlFor="sample-index" className="text-sm font-medium text-white">
-                  Sample Row
-                </label>
-                <input
-                  id="sample-index"
-                  type="number"
-                  min={0}
-                  max={Math.max((simulationInfo?.totalSamples ?? datasetMeta?.samplesPerClass ?? 1) - 1, 0)}
-                  value={selectedIndex}
-                  onChange={(event) => setSelectedIndex(Number(event.target.value) || 0)}
-                  disabled={simulationMode === "all"}
-                  className="mt-3 w-full rounded-2xl border border-white/10 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none disabled:cursor-not-allowed disabled:opacity-60"
-                />
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-white">Live Disturbance Stream</p>
+                  <p className="mt-1 text-sm text-slate-400">
+                    Random waveform simulation across the full 17-class dataset, streamed as one AI-driven demo feed.
+                  </p>
+                </div>
+                <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium text-cyan-200">
+                  All classes live
+                </span>
               </div>
             </div>
 
             <p className="mt-4 text-sm text-slate-400">
-              {simulationMode === "all"
-                ? "Random demo mode samples across all 17 class CSV files to simulate a live disturbance stream."
-                : "Single class mode uses the real dataset CSV files directly. Each step loads one true 100-sample waveform row and classifies it live."}
+              The stream keeps sampling from the full dataset and turns each waveform into live telemetry, AI prediction, explanation, and chart updates.
             </p>
 
             <div className="mt-4 flex flex-wrap gap-3">
               <button
                 type="button"
-                onClick={() =>
-                  void loadWaveform(
-                    simulationMode === "all"
-                      ? { mode: "all" }
-                      : { mode: "single", className: selectedClass, sampleIndex: selectedIndex },
-                  )
-                }
-                disabled={(simulationMode === "single" && !selectedClass) || loading}
+                onClick={() => void loadWaveform({ mode: "all" })}
+                disabled={loading}
                 className="rounded-full bg-cyan-400 px-4 py-2 text-sm font-semibold text-slate-950 transition disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {loading ? "Running..." : simulationMode === "all" ? "Run Random Demo Step" : "Load Sample"}
+                {loading ? "Running..." : "Run Stream Step"}
               </button>
 
               <button
                 type="button"
-                onClick={() =>
-                  void loadWaveform(
-                    simulationMode === "all"
-                      ? { mode: "all" }
-                      : { mode: "single", className: selectedClass, random: true },
-                  )
-                }
-                disabled={(simulationMode === "single" && !selectedClass) || loading}
+                onClick={() => void loadWaveform({ mode: "all" })}
+                disabled={loading}
                 className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Random Sample
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  if (simulationMode === "all" || !selectedClass) {
-                    return;
-                  }
-                  setAutoplay(false);
-                  const total = simulationInfo?.totalSamples ?? datasetMeta?.samplesPerClass ?? 1000;
-                  const nextIndex = selectedIndex <= 0 ? total - 1 : selectedIndex - 1;
-                  void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: nextIndex });
-                }}
-                disabled={simulationMode === "all" || !selectedClass || loading}
-                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Previous
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  if (simulationMode === "all" || !selectedClass) {
-                    return;
-                  }
-                  setAutoplay(false);
-                  const total = simulationInfo?.totalSamples ?? datasetMeta?.samplesPerClass ?? 1000;
-                  const nextIndex = (selectedIndex + 1) % total;
-                  void loadWaveform({ mode: "single", className: selectedClass, sampleIndex: nextIndex });
-                }}
-                disabled={simulationMode === "all" || !selectedClass || loading}
-                className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Next
+                Refresh Stream
               </button>
 
               <button
                 type="button"
                 onClick={() => setAutoplay((current) => !current)}
-                disabled={simulationMode === "single" && !selectedClass}
                 className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {autoplay ? "Stop Demo" : "Start Auto-Play"}
+                {autoplay ? "Pause Live Stream" : "Start Live Stream"}
               </button>
             </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-3 text-xs uppercase tracking-[0.16em] text-slate-500">
               <span>{signal ? "100-point waveform loaded" : "Waiting for waveform sample"}</span>
-              <span>mode: {simulationMode === "all" ? "all classes" : "single class"}</span>
-              {simulationInfo ? <span>source: {simulationInfo.className}</span> : null}
-              {simulationInfo ? <span>row: {simulationInfo.sampleIndex}</span> : null}
+              <span>mode: live dataset stream</span>
               {selectedFile ? <span>manual file: {selectedFile}</span> : null}
             </div>
 
             <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
-              <p className="text-sm font-medium text-white">Waveform Preview</p>
-              {!signal ? (
+              <p className="text-sm font-medium text-white">Live Disturbance Stream</p>
+              {disturbanceStreamData.length === 0 ? (
                 <p className="mt-3 text-sm text-slate-400">
-                  Load a valid signal to preview all 100 samples before classification.
+                  Start the live stream to build the combined disturbance waveform feed.
                 </p>
               ) : (
-                <div className="mt-3">
+                <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/50 p-4">
                   <LineChartCard
-                    data={waveformPreview}
+                    data={disturbanceStreamData}
                     xKey="sample"
                     series={[{ dataKey: "amplitude", name: "Amplitude", color: "#22d3ee" }]}
                   />
                 </div>
               )}
+            </div>
+
+            <div className="mt-4 space-y-4">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                  <p className="text-xs font-medium text-slate-500">Voltage</p>
+                  <p className="mt-2 text-xl font-semibold text-white">{liveTelemetry.voltage.toFixed(1)} V</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                  <p className="text-xs font-medium text-slate-500">Current</p>
+                  <p className="mt-2 text-xl font-semibold text-white">{liveTelemetry.current.toFixed(2)} A</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                  <p className="text-xs font-medium text-slate-500">Frequency</p>
+                  <p className="mt-2 text-xl font-semibold text-white">{liveTelemetry.frequency.toFixed(2)} Hz</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                  <p className="text-xs font-medium text-slate-500">Load</p>
+                  <p className="mt-2 text-xl font-semibold text-white">{liveTelemetry.load.toFixed(2)} kW</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                  <p className="text-xs font-medium text-slate-500">Power Factor</p>
+                  <p className="mt-2 text-xl font-semibold text-white">{liveTelemetry.powerFactor.toFixed(3)}</p>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-sm font-medium text-white">Waveform Preview</p>
+                  <span className="rounded-full border border-white/10 bg-slate-950/60 px-3 py-1 text-xs font-medium text-cyan-200">
+                    Sample {processedSamples}/{signal?.length ?? 0}
+                  </span>
+                </div>
+                {!signal ? (
+                  <p className="mt-3 text-sm text-slate-400">
+                    Load a valid signal to preview all 100 samples before classification.
+                  </p>
+                ) : (
+                  <div className="mt-4 space-y-4">
+                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                        <p className="text-xs font-medium text-slate-500">Current sample</p>
+                        <p className="mt-2 text-xl font-semibold text-white">
+                          {currentSampleValue === null ? "--" : currentSampleValue.toFixed(4)}
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                        <p className="text-xs font-medium text-slate-500">RMS so far</p>
+                        <p className="mt-2 text-xl font-semibold text-white">{liveMetrics.rms.toFixed(4)}</p>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                        <p className="text-xs font-medium text-slate-500">Peak / trough</p>
+                        <p className="mt-2 text-xl font-semibold text-white">
+                          {liveMetrics.peak.toFixed(3)} / {liveMetrics.trough.toFixed(3)}
+                        </p>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-slate-950/60 p-4">
+                        <p className="text-xs font-medium text-slate-500">Playback progress</p>
+                        <p className="mt-2 text-xl font-semibold text-white">{playbackProgress.toFixed(0)}%</p>
+                      </div>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                      <div className="h-2 overflow-hidden rounded-full bg-white/5">
+                        <div
+                          className="h-full rounded-full bg-cyan-400 transition-all duration-75"
+                          style={{ width: `${playbackProgress}%` }}
+                        />
+                      </div>
+                      <div className="mt-4">
+                        <LineChartCard
+                          data={liveWaveformPreview}
+                          xKey="sample"
+                          series={[{ dataKey: "amplitude", name: "Amplitude", color: "#22d3ee" }]}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <p className="text-sm font-medium text-white">Event Count by Predicted Class</p>
+                <p className="mt-1 text-sm text-slate-400">
+                  Counts which AI-predicted disturbance classes are appearing most often in the current live stream window.
+                </p>
+                {predictedDistribution.length === 0 ? (
+                  <p className="mt-3 text-sm text-slate-400">No simulated events yet.</p>
+                ) : (
+                  <div className="mt-3">
+                    <BarChartCard data={predictedDistribution} xKey="className" yKey="count" color="#34d399" />
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-4">
@@ -674,94 +844,94 @@ export function WaveformClassifierCard() {
               </p>
             ) : (
               <div className="mt-4 space-y-4">
-                <div className="rounded-2xl bg-slate-950/70 p-4">
-                  <p className="text-xs uppercase tracking-[0.18em] text-cyan-300">Predicted Label</p>
-                  <div className="mt-3 flex flex-wrap items-center gap-3">
-                    <p className="text-xl font-semibold text-white">{result.predicted_class}</p>
-                    <span
-                      className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] ${severityStyle.badge}`}
-                    >
-                      {result.predicted_label === 0 ? "Stable" : "Attention"}
-                    </span>
-                    {latestHistoryEntry ? (
-                      <span
-                        className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] ${
-                          latestHistoryEntry.isCorrect
-                            ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
-                            : "border-rose-400/20 bg-rose-400/10 text-rose-200"
-                        }`}
-                      >
-                        {latestHistoryEntry.isCorrect ? "Correct" : "Mismatch"}
-                      </span>
-                    ) : null}
-                  </div>
-                  <p className="mt-2 text-sm text-slate-400">Class ID {result.predicted_label}</p>
-                  {simulationInfo ? (
-                    <div className="mt-3 space-y-1 text-sm text-slate-400">
-                      <p>True/source class: {simulationInfo.className}</p>
-                      <p>Source row: {simulationInfo.sampleIndex}</p>
-                    </div>
-                  ) : null}
-                </div>
-
-                <div className="rounded-2xl bg-slate-950/70 p-4">
-                  <p className="text-xs uppercase tracking-[0.18em] text-emerald-300">Confidence</p>
-                  <p className="mt-2 text-2xl font-semibold text-white">{(result.confidence * 100).toFixed(2)}%</p>
-                </div>
-
-                <div className="rounded-2xl bg-slate-950/70 p-4">
-                  <p className="text-xs uppercase tracking-[0.18em] text-amber-300">Top 3 Predictions</p>
-                  <div className="mt-3">
-                    <BarChartCard data={topProbabilityData} xKey="className" yKey="confidence" color="#f59e0b" />
-                  </div>
-                  <div className="mt-3 space-y-3">
-                    {result.top_k.map((item, index) => (
-                      <div
-                        key={`${item.predicted_label}-${index}`}
-                        className="flex items-center justify-between rounded-2xl bg-white/5 px-3 py-3"
-                      >
-                        <div>
-                          <p className="text-sm font-medium text-white">{item.predicted_class}</p>
-                          <p className="text-xs text-slate-400">Class ID {item.predicted_label}</p>
-                        </div>
-                        <p className="text-sm font-semibold text-slate-100">
-                          {(item.confidence * 100).toFixed(2)}%
-                        </p>
+                <div className="rounded-2xl bg-slate-950/70 p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="space-y-3">
+                      <p className="text-xs font-medium text-cyan-300">Predicted class</p>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <p className="text-2xl font-semibold text-white">{result.predicted_class}</p>
+                        <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${severityStyle.badge}`}>
+                          {result.predicted_label === 0 ? "Stable" : "Attention"}
+                        </span>
                       </div>
-                    ))}
+                      <p className="text-sm text-slate-400">Class ID {result.predicted_label}</p>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-right">
+                      <p className="text-xs font-medium text-emerald-300">Confidence</p>
+                      <p className="mt-1 text-3xl font-semibold text-white">{(result.confidence * 100).toFixed(2)}%</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                      <p className="text-xs font-medium text-slate-400">AI answer</p>
+                      <p className="mt-2 text-sm text-white">{result.predicted_class}</p>
+                    </div>
+                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                      <p className="text-xs font-medium text-slate-400">Stream status</p>
+                      <p className="mt-2 text-sm text-white">{autoplay ? "Streaming live" : "Paused"}</p>
+                    </div>
                   </div>
                 </div>
+
               </div>
             )}
           </div>
 
-          <div className={`rounded-2xl border p-4 ${severityStyle.panel}`}>
-            <p className={`text-sm font-medium ${severityStyle.accent}`}>AI Explanation Layer</p>
-            {!explanation ? (
-              <p className="mt-3 text-sm leading-6 text-slate-300">
+          <div className={`rounded-2xl border p-5 ${severityStyle.panel}`}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className={`text-sm font-medium ${severityStyle.accent}`}>AI Explanation Layer</p>
+              {explanation ? (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1 text-xs font-medium text-slate-200">
+                    {explanation.source === "llm" ? "LLM explanation" : "Local fallback"}
+                  </span>
+                  {loading ? (
+                    <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-medium text-cyan-200">
+                      Updating...
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+            {explanationLoading ? (
+              <p className="mt-4 text-sm leading-6 text-slate-300">
+                Generating the next explanation while keeping the current one visible.
+              </p>
+            ) : !explanation ? (
+              <p className="mt-4 text-sm leading-6 text-slate-300">
                 No explanation yet. Run the waveform simulation to generate a classifier explanation.
               </p>
             ) : (
-              <div className="mt-3 space-y-4 text-sm text-slate-300">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-slate-400">What Is Happening</p>
+              <div className="mt-4 grid gap-4 text-sm text-slate-300 lg:grid-cols-2">
+                <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4 lg:col-span-2">
+                  <p className="text-xs font-medium text-slate-400">Summary</p>
                   <p className="mt-2 leading-6">{explanation.summary}</p>
                 </div>
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Likely Cause</p>
-                  <p className="mt-2 leading-6">{explanation.likelyCause}</p>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                  <p className="text-xs font-medium text-slate-400">What is happening</p>
+                  <p className="mt-2 leading-6">{explanation.what_is_happening}</p>
                 </div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Severity</p>
-                  <span
-                    className={`rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] ${severityStyle.badge}`}
-                  >
-                    {explanation.severity}
-                  </span>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                  <p className="text-xs font-medium text-slate-400">Likely cause</p>
+                  <p className="mt-2 leading-6">{explanation.likely_cause}</p>
                 </div>
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Recommended Action</p>
-                  <p className="mt-2 leading-6">{explanation.recommendedAction}</p>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <p className="text-xs font-medium text-slate-400">Severity</p>
+                    <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${severityStyle.badge}`}>
+                      {explanation.severity}
+                    </span>
+                  </div>
+                  <p className="mt-3 leading-6">{explanation.severity_reason}</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4 lg:col-span-2">
+                  <p className="text-xs font-medium text-slate-400">Recommended action</p>
+                  <p className="mt-2 leading-6">{explanation.recommended_action}</p>
+                </div>
+                <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4 lg:col-span-2">
+                  <p className="text-xs font-medium text-slate-400">Operator note</p>
+                  <p className="mt-2 leading-6">{explanation.operator_note}</p>
                 </div>
               </div>
             )}
@@ -775,12 +945,12 @@ export function WaveformClassifierCard() {
                 <p className="mt-2 text-xl font-semibold text-white">{sessionSummary.samplesShown}</p>
               </div>
               <div className="rounded-2xl bg-slate-950/70 p-4">
-                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Correct Predictions</p>
-                <p className="mt-2 text-xl font-semibold text-white">{sessionSummary.correctPredictions}</p>
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Average Confidence</p>
+                <p className="mt-2 text-xl font-semibold text-white">{sessionSummary.averageConfidence}%</p>
               </div>
               <div className="rounded-2xl bg-slate-950/70 p-4">
-                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Session Accuracy</p>
-                <p className="mt-2 text-xl font-semibold text-white">{sessionSummary.sessionAccuracy}%</p>
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Active Mode</p>
+                <p className="mt-2 text-xl font-semibold text-white">Live Stream</p>
               </div>
             </div>
           </div>
@@ -801,43 +971,35 @@ export function WaveformClassifierCard() {
           </div>
 
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-            <p className="text-sm font-medium text-white">Event Count by Predicted Class</p>
-            {predictedDistribution.length === 0 ? (
-              <p className="mt-3 text-sm text-slate-400">No simulated events yet.</p>
-            ) : (
-              <div className="mt-3">
-                <BarChartCard data={predictedDistribution} xKey="className" yKey="count" color="#34d399" />
-              </div>
-            )}
-          </div>
-
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-            <p className="text-sm font-medium text-white">Severity Distribution</p>
-            {severityDistribution.length === 0 ? (
-              <p className="mt-3 text-sm text-slate-400">Severity distribution will appear after simulation runs.</p>
-            ) : (
-              <div className="mt-3">
-                <BarChartCard data={severityDistribution} xKey="name" yKey="value" color="#fb7185" />
-              </div>
-            )}
-          </div>
-
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
             <p className="text-sm font-medium text-white">Recent Predictions Timeline</p>
             {history.length === 0 ? (
               <p className="mt-3 text-sm text-slate-400">Recent simulated predictions will appear here.</p>
             ) : (
               <div className="mt-3 space-y-3">
-                {[...history].reverse().slice(0, 6).map((entry) => {
-                  const isSelected = selectedHistoryEntry?.run === entry.run;
+                {[...history].reverse().slice(0, 5).map((entry) => {
+                  const isExpanded = expandedRuns.includes(entry.run);
+                  const entryWaveform = entry.signal.map((value, index) => ({
+                    sample: index,
+                    amplitude: Number(value.toFixed(6)),
+                  }));
+                  const entryTopK = entry.topK.map((item) => ({
+                    className: item.predicted_class,
+                    confidence: Number((item.confidence * 100).toFixed(2)),
+                  }));
 
                   return (
                     <div key={`${entry.run}-${entry.timestamp}`} className="space-y-3">
                       <button
                         type="button"
-                        onClick={() => setSelectedRun(entry.run)}
+                        onClick={() =>
+                          setExpandedRuns((current) =>
+                            current.includes(entry.run)
+                              ? current.filter((run) => run !== entry.run)
+                              : [entry.run, ...current],
+                          )
+                        }
                         className={`w-full rounded-2xl border p-4 text-left transition ${
-                          isSelected
+                          isExpanded
                             ? "border-cyan-400/30 bg-cyan-400/10 shadow-[0_0_0_1px_rgba(34,211,238,0.15)]"
                             : "border-white/10 bg-slate-950/70 hover:border-white/20 hover:bg-white/10"
                         } cursor-pointer`}
@@ -847,22 +1009,11 @@ export function WaveformClassifierCard() {
                             <p className="text-sm font-semibold text-white">
                               Run {entry.run}: {entry.predictedClass}
                             </p>
-                            <p className="text-sm text-slate-400">
-                              Source {entry.sourceClass} row {entry.sourceIndex}
-                            </p>
+                            <p className="text-sm text-slate-400">AI classification event</p>
                           </div>
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-medium text-slate-300">
                               {entry.timestamp}
-                            </span>
-                            <span
-                              className={`rounded-full border px-3 py-1 text-xs font-medium ${
-                                entry.isCorrect
-                                  ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
-                                  : "border-rose-400/20 bg-rose-400/10 text-rose-200"
-                              }`}
-                            >
-                              {entry.isCorrect ? "Correct" : "Mismatch"}
                             </span>
                             <span
                               className={`rounded-full border px-3 py-1 text-xs font-medium ${
@@ -882,41 +1033,41 @@ export function WaveformClassifierCard() {
                             Confidence {(entry.confidence * 100).toFixed(2)}%
                           </p>
                           <span className="text-sm text-cyan-200">
-                            {isSelected ? "Viewing details" : "Click for details"}
+                            {isExpanded ? "Hide details" : "Show details"}
                           </span>
                         </div>
                       </button>
 
-                      {isSelected && selectedHistoryEntry ? (
-                        <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-4">
+                      {isExpanded ? (
+                        <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-5">
                           <p className="text-sm font-medium text-white">Selected Run Details</p>
-                          <div className="mt-4 grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
-                            <div className="space-y-4">
-                              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                          <div className="mt-5 grid gap-5 xl:grid-cols-2">
+                            <div className="space-y-5">
+                              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
                                 <p className="text-sm font-medium text-white">Waveform Preview</p>
                                 <div className="mt-3">
                                   <LineChartCard
-                                    data={selectedHistoryWaveform}
+                                    data={entryWaveform}
                                     xKey="sample"
                                     series={[{ dataKey: "amplitude", name: "Amplitude", color: "#22d3ee" }]}
                                   />
                                 </div>
                               </div>
 
-                              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
                                 <p className="text-sm font-medium text-white">Top 3 Predictions</p>
                                 <div className="mt-3">
                                   <BarChartCard
-                                    data={selectedHistoryTopK}
+                                    data={entryTopK}
                                     xKey="className"
                                     yKey="confidence"
                                     color="#f59e0b"
                                   />
                                 </div>
                                 <div className="mt-3 space-y-3">
-                                  {selectedHistoryEntry.topK.map((item, index) => (
+                                  {entry.topK.map((item, index) => (
                                     <div
-                                      key={`${selectedHistoryEntry.run}-${item.predicted_label}-${index}`}
+                                      key={`${entry.run}-${item.predicted_label}-${index}`}
                                       className="flex items-center justify-between rounded-2xl bg-slate-900/80 px-3 py-3"
                                     >
                                       <div>
@@ -932,55 +1083,68 @@ export function WaveformClassifierCard() {
                               </div>
                             </div>
 
-                            <div className="space-y-4">
-                              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                            <div className="space-y-5">
+                              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
                                 <p className="text-sm font-medium text-white">Prediction Summary</p>
-                                <div className="mt-3 space-y-3 text-sm text-slate-300">
-                                  <p>True/source class: {selectedHistoryEntry.sourceClass}</p>
-                                  <p>Source row: {selectedHistoryEntry.sourceIndex}</p>
-                                  <p>Predicted class: {selectedHistoryEntry.predictedClass}</p>
-                                  <p>Confidence: {(selectedHistoryEntry.confidence * 100).toFixed(2)}%</p>
-                                  <p>Severity: {selectedHistoryEntry.severity}</p>
-                                  <p>Timestamp: {selectedHistoryEntry.timestamp}</p>
+                                <div className="mt-4 grid gap-3 text-sm text-slate-300 md:grid-cols-2">
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">Predicted class</p>
+                                    <p className="mt-2 text-white">{entry.predictedClass}</p>
+                                  </div>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">Confidence</p>
+                                    <p className="mt-2 text-white">{(entry.confidence * 100).toFixed(2)}%</p>
+                                  </div>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">Severity</p>
+                                    <p className="mt-2 text-white">{entry.severity}</p>
+                                  </div>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">Timestamp</p>
+                                    <p className="mt-2 text-white">{entry.timestamp}</p>
+                                  </div>
                                 </div>
                                 <div className="mt-4 flex flex-wrap gap-2">
                                   <span
                                     className={`rounded-full border px-3 py-1 text-xs font-medium ${
-                                      selectedHistoryEntry.isCorrect
-                                        ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
-                                        : "border-rose-400/20 bg-rose-400/10 text-rose-200"
-                                    }`}
-                                  >
-                                    {selectedHistoryEntry.isCorrect ? "Correct" : "Mismatch"}
-                                  </span>
-                                  <span
-                                    className={`rounded-full border px-3 py-1 text-xs font-medium ${
-                                      selectedHistoryEntry.severity === "high"
+                                      entry.severity === "high"
                                         ? "border-rose-400/20 bg-rose-400/10 text-rose-200"
-                                        : selectedHistoryEntry.severity === "medium"
+                                        : entry.severity === "medium"
                                           ? "border-amber-400/20 bg-amber-400/10 text-amber-200"
                                           : "border-emerald-400/20 bg-emerald-400/10 text-emerald-200"
                                     }`}
                                   >
-                                    Severity {selectedHistoryEntry.severity}
+                                    Severity {entry.severity}
                                   </span>
                                 </div>
                               </div>
 
-                              <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
                                 <p className="text-sm font-medium text-white">Explanation</p>
-                                <div className="mt-3 space-y-4 text-sm text-slate-300">
-                                  <div>
-                                    <p className="text-xs text-slate-500">What is happening</p>
-                                    <p className="mt-1 leading-6">{selectedHistoryEntry.explanation.summary}</p>
+                                <div className="mt-4 grid gap-4 text-sm text-slate-300 lg:grid-cols-2">
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4 lg:col-span-2">
+                                    <p className="text-xs font-medium text-slate-500">Summary</p>
+                                    <p className="mt-2 leading-6">{entry.explanation.summary}</p>
                                   </div>
-                                  <div>
-                                    <p className="text-xs text-slate-500">Likely cause</p>
-                                    <p className="mt-1 leading-6">{selectedHistoryEntry.explanation.likelyCause}</p>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">What is happening</p>
+                                    <p className="mt-2 leading-6">{entry.explanation.what_is_happening}</p>
                                   </div>
-                                  <div>
-                                    <p className="text-xs text-slate-500">Recommended action</p>
-                                    <p className="mt-1 leading-6">{selectedHistoryEntry.explanation.recommendedAction}</p>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">Likely cause</p>
+                                    <p className="mt-2 leading-6">{entry.explanation.likely_cause}</p>
+                                  </div>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
+                                    <p className="text-xs font-medium text-slate-500">Severity reason</p>
+                                    <p className="mt-2 leading-6">{entry.explanation.severity_reason}</p>
+                                  </div>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4 lg:col-span-2">
+                                    <p className="text-xs font-medium text-slate-500">Recommended action</p>
+                                    <p className="mt-2 leading-6">{entry.explanation.recommended_action}</p>
+                                  </div>
+                                  <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4 lg:col-span-2">
+                                    <p className="text-xs font-medium text-slate-500">Operator note</p>
+                                    <p className="mt-2 leading-6">{entry.explanation.operator_note}</p>
                                   </div>
                                 </div>
                               </div>

@@ -7,57 +7,62 @@ import { PanelCard } from "@/components/dashboard/panel-card";
 import { SeverityBadge, StatusBadge } from "@/components/dashboard/status-badge";
 import { AppShell } from "@/components/layout/app-shell";
 import { StatePanel } from "@/components/layout/state-panel";
+import {
+  createAlert,
+  createAnomaliesFromReading,
+  createInitialAlerts,
+  createInitialAnomalies,
+  createInitialReadings,
+  getAlertPriorityFromReading,
+  stepReading,
+} from "@/lib/live-sim";
 import type { Alert, Anomaly, GridReading } from "@/types/grid";
 
-type ApiResponse<T> = {
-  ok: boolean;
-  data: T;
-  error: string | null;
-};
-
-type AnomalyResponse = ApiResponse<Anomaly[]> & { alerts?: Alert[] };
-
 export default function DashboardPage() {
-  const [readings, setReadings] = useState<GridReading[]>([]);
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [readings, setReadings] = useState<GridReading[]>(() => createInitialReadings(24, "dashboard"));
+  const [alerts, setAlerts] = useState<Alert[]>(() =>
+    createInitialAlerts(createInitialReadings(12, "dashboard-alerts"), 5, "live-dashboard-simulator", "dashboard event"),
+  );
+  const [anomalies, setAnomalies] = useState<Anomaly[]>(() =>
+    createInitialAnomalies(createInitialReadings(12, "dashboard-anomalies"), 6, "dashboard"),
+  );
 
   useEffect(() => {
-    async function load() {
-      try {
-        setLoading(true);
-        setError(null);
-
-        const [readingsRes, anomaliesRes, alertsRes] = await Promise.all([
-          fetch("/api/grid/readings?limit=24", { cache: "no-store" }),
-          fetch("/api/grid/anomalies?limit=6&createAlerts=true", { cache: "no-store" }),
-          fetch("/api/alerts?limit=5", { cache: "no-store" }),
-        ]);
-
-        const readingsJson = (await readingsRes.json()) as ApiResponse<GridReading[]>;
-        const anomaliesJson = (await anomaliesRes.json()) as AnomalyResponse;
-        const alertsJson = (await alertsRes.json()) as ApiResponse<Alert[]>;
-
-        if (!readingsJson.ok) throw new Error(readingsJson.error ?? "Failed to load readings.");
-        if (!anomaliesJson.ok) throw new Error(anomaliesJson.error ?? "Failed to load anomalies.");
-        if (!alertsJson.ok) throw new Error(alertsJson.error ?? "Failed to load alerts.");
-
-        setReadings(readingsJson.data);
-        setAnomalies(anomaliesJson.data);
-        setAlerts(alertsJson.data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Unable to load dashboard.");
-      } finally {
-        setLoading(false);
-      }
+    if (readings.length === 0) {
+      return;
     }
 
-    load();
-  }, []);
+    const timer = window.setInterval(() => {
+      setReadings((current) => {
+        const base = current[current.length - 1];
+        if (!base) {
+          return current;
+        }
+        const nextReading = stepReading(base, "dashboard");
 
-  const latest = readings[0];
+        setAnomalies((currentAnomalies) => {
+          const nextItems = [...createAnomaliesFromReading(nextReading, "dashboard"), ...currentAnomalies];
+          return nextItems.slice(0, 6);
+        });
+
+        setAlerts((currentAlerts) => {
+          const priority = getAlertPriorityFromReading(nextReading);
+          if (!priority) {
+            return currentAlerts;
+          }
+
+          const nextAlert = createAlert(priority, "live-dashboard-simulator", "dashboard event");
+          return [nextAlert, ...currentAlerts].slice(0, 5);
+        });
+
+        return [...current.slice(-23), nextReading];
+      });
+    }, 2000);
+
+    return () => window.clearInterval(timer);
+  }, [readings.length]);
+
+  const latest = readings[readings.length - 1];
   const chartData = useMemo(
     () =>
       [...readings]
@@ -66,6 +71,7 @@ export default function DashboardPage() {
           time: new Date(reading.recorded_at).toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",
+            second: "2-digit",
           }),
           load: reading.load,
           voltage: reading.voltage,
@@ -73,22 +79,6 @@ export default function DashboardPage() {
         })),
     [readings],
   );
-
-  if (loading) {
-    return (
-      <AppShell title="Dashboard" subtitle="Real-time grid health, alerts, and operating metrics.">
-        <StatePanel title="Loading dashboard" message="Fetching live grid readings and alert status." />
-      </AppShell>
-    );
-  }
-
-  if (error) {
-    return (
-      <AppShell title="Dashboard" subtitle="Real-time grid health, alerts, and operating metrics.">
-        <StatePanel title="Unable to load data" message={error} />
-      </AppShell>
-    );
-  }
 
   if (!latest) {
     return (
@@ -156,12 +146,12 @@ export default function DashboardPage() {
         </PanelCard>
 
         <PanelCard title="Recent Alerts" subtitle="Latest generated system alerts">
-          <div className="space-y-3">
-            {alerts.length === 0 ? (
-              <p className="text-sm text-slate-400">No active alerts available.</p>
-            ) : (
-              alerts.map((alert) => (
-                <div key={alert.id} className="rounded-2xl bg-white/5 p-4">
+            <div className="space-y-3">
+              {alerts.length === 0 ? (
+                <p className="text-sm text-slate-400">No active alerts available.</p>
+              ) : (
+                alerts.slice(0, 5).map((alert) => (
+                  <div key={alert.id} className="rounded-2xl bg-white/5 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="font-medium text-white">{alert.title}</p>
                     <SeverityBadge value={alert.priority} />

@@ -2,62 +2,69 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { WaveformClassifierCard } from "@/components/analytics/waveform-classifier-card";
-import { BarChartCard, PieChartCard } from "@/components/charts/bar-chart-card";
+import { BarChartCard } from "@/components/charts/bar-chart-card";
 import { LineChartCard } from "@/components/charts/line-chart-card";
 import { PanelCard } from "@/components/dashboard/panel-card";
 import { AppShell } from "@/components/layout/app-shell";
 import { StatePanel } from "@/components/layout/state-panel";
+import {
+  createAlert,
+  createAnomaliesFromReading,
+  createInitialAlerts,
+  createInitialAnomalies,
+  createPredictionFromReading,
+  createInitialPredictions,
+  createInitialReadings,
+  getAlertPriorityFromReading,
+  stepReading,
+} from "@/lib/live-sim";
 import type { Alert, Anomaly, GridReading, Prediction } from "@/types/grid";
 
-type ApiResponse<T> = {
-  ok: boolean;
-  data: T;
-  error: string | null;
-};
-
 export default function AnalyticsPage() {
-  const [readings, setReadings] = useState<GridReading[]>([]);
-  const [predictions, setPredictions] = useState<Prediction[]>([]);
-  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [readings, setReadings] = useState<GridReading[]>(() => createInitialReadings(24, "analytics"));
+  const [predictions, setPredictions] = useState<Prediction[]>(() =>
+    createInitialPredictions(createInitialReadings(12, "analytics-predictions"), 12, "analytics"),
+  );
+  const [anomalies, setAnomalies] = useState<Anomaly[]>(() =>
+    createInitialAnomalies(createInitialReadings(24, "analytics-anomalies"), 24, "analytics"),
+  );
+  const [alerts, setAlerts] = useState<Alert[]>(() =>
+    createInitialAlerts(createInitialReadings(24, "analytics-alerts"), 24, "live-simulator"),
+  );
 
   useEffect(() => {
-    async function load() {
-      try {
-        setLoading(true);
-        setError(null);
+    const timer = window.setInterval(() => {
+      setReadings((current) => {
+        const base = current[current.length - 1];
+        if (!base) {
+          return current;
+        }
+        const nextReading = stepReading(base, "analytics");
 
-        const [readingsRes, predictionsRes, anomaliesRes, alertsRes] = await Promise.all([
-          fetch("/api/grid/readings?limit=24", { cache: "no-store" }),
-          fetch("/api/grid/predict?limit=12", { cache: "no-store" }),
-          fetch("/api/grid/anomalies?limit=24&createAlerts=false", { cache: "no-store" }),
-          fetch("/api/alerts?limit=24", { cache: "no-store" }),
+        setPredictions((currentPredictions) => [
+          ...currentPredictions.slice(-11),
+          createPredictionFromReading(nextReading, "analytics"),
         ]);
 
-        const readingsJson = (await readingsRes.json()) as ApiResponse<GridReading[]>;
-        const predictionsJson = (await predictionsRes.json()) as ApiResponse<Prediction[]>;
-        const anomaliesJson = (await anomaliesRes.json()) as ApiResponse<Anomaly[]>;
-        const alertsJson = (await alertsRes.json()) as ApiResponse<Alert[]>;
+        setAnomalies((currentAnomalies) => [
+          ...currentAnomalies.slice(-20),
+          ...createAnomaliesFromReading(nextReading, "analytics"),
+        ]);
 
-        if (!readingsJson.ok) throw new Error(readingsJson.error ?? "Failed to load readings.");
-        if (!predictionsJson.ok) throw new Error(predictionsJson.error ?? "Failed to load predictions.");
-        if (!anomaliesJson.ok) throw new Error(anomaliesJson.error ?? "Failed to load anomalies.");
-        if (!alertsJson.ok) throw new Error(alertsJson.error ?? "Failed to load alerts.");
+        setAlerts((currentAlerts) => {
+          const priority = getAlertPriorityFromReading(nextReading);
+          if (!priority) {
+            return currentAlerts;
+          }
 
-        setReadings(readingsJson.data);
-        setPredictions(predictionsJson.data);
-        setAnomalies(anomaliesJson.data);
-        setAlerts(alertsJson.data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Unable to load analytics.");
-      } finally {
-        setLoading(false);
-      }
-    }
+          return [...currentAlerts.slice(-23), createAlert(priority, "live-simulator")];
+        });
 
-    load();
+        return [...current.slice(-23), nextReading];
+      });
+    }, 1500);
+
+    return () => window.clearInterval(timer);
   }, []);
 
   const trendData = useMemo(
@@ -68,6 +75,7 @@ export default function AnalyticsPage() {
           time: new Date(reading.recorded_at).toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",
+            second: "2-digit",
           }),
           load: reading.load,
           frequency: reading.frequency,
@@ -85,6 +93,7 @@ export default function AnalyticsPage() {
       time: new Date(reading.recorded_at).toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
+        second: "2-digit",
       }),
       actual: reading.load,
       predicted: predictions[index]?.predicted_load ?? reading.load * 1.04,
@@ -118,22 +127,6 @@ export default function AnalyticsPage() {
     return Object.entries(counts).map(([name, value]) => ({ name, value }));
   }, [anomalies]);
 
-  if (loading) {
-    return (
-      <AppShell title="Analytics" subtitle="Historical and predictive grid intelligence.">
-        <StatePanel title="Loading analytics" message="Preparing trends, anomalies, and prediction views." />
-      </AppShell>
-    );
-  }
-
-  if (error) {
-    return (
-      <AppShell title="Analytics" subtitle="Historical and predictive grid intelligence.">
-        <StatePanel title="Unable to load analytics" message={error} />
-      </AppShell>
-    );
-  }
-
   if (readings.length === 0) {
     return (
       <AppShell title="Analytics" subtitle="Historical and predictive grid intelligence.">
@@ -144,6 +137,10 @@ export default function AnalyticsPage() {
 
   return (
     <AppShell title="Analytics" subtitle="Historical and predictive grid intelligence.">
+      <div className="mb-6">
+        <WaveformClassifierCard />
+      </div>
+
       <div className="grid gap-6 xl:grid-cols-2">
         <PanelCard title="Grid Trend" subtitle="Load, voltage, and frequency over time">
           <LineChartCard
@@ -170,7 +167,7 @@ export default function AnalyticsPage() {
       </div>
 
       <div className="mt-6 grid gap-6 xl:grid-cols-2">
-        <PanelCard title="Anomaly Count" subtitle="Rule-based detections by metric">
+        <PanelCard title="Live Event Count" subtitle="Counts the most recent simulated operating events by metric so you can see whether voltage, load, or frequency is driving the current activity.">
           {anomalyCounts.length === 0 ? (
             <p className="text-sm text-slate-400">No anomaly counts available.</p>
           ) : (
@@ -178,16 +175,11 @@ export default function AnalyticsPage() {
           )}
         </PanelCard>
 
-        <PanelCard title="Alert Severity" subtitle="Alert distribution by priority">
+        <PanelCard title="Alert Severity" subtitle="Shows how many live alerts are currently high, medium, or low priority, so you can see urgency without interpreting pie slices.">
           {alertSeverity.length === 0 ? (
             <p className="text-sm text-slate-400">No alert severity data available.</p>
           ) : (
-            <PieChartCard
-              data={alertSeverity}
-              dataKey="value"
-              nameKey="name"
-              colors={["#fb7185", "#fbbf24", "#34d399"]}
-            />
+            <BarChartCard data={alertSeverity} xKey="name" yKey="value" color="#f59e0b" />
           )}
         </PanelCard>
       </div>
@@ -240,22 +232,13 @@ export default function AnalyticsPage() {
           />
         </PanelCard>
 
-        <PanelCard title="Disturbance Distribution" subtitle="Current disturbance mix from detected anomalies">
+        <PanelCard title="Disturbance Distribution" subtitle="Shows which disturbance/event types are appearing most often in the current simulated anomaly window, ranked by count.">
           {disturbanceDistribution.length === 0 ? (
             <p className="text-sm text-slate-400">No disturbance distribution available.</p>
           ) : (
-            <PieChartCard
-              data={disturbanceDistribution}
-              dataKey="value"
-              nameKey="name"
-              colors={["#22d3ee", "#fb7185", "#f59e0b", "#34d399", "#a78bfa"]}
-            />
+            <BarChartCard data={disturbanceDistribution} xKey="name" yKey="value" color="#22d3ee" />
           )}
         </PanelCard>
-      </div>
-
-      <div className="mt-6">
-        <WaveformClassifierCard />
       </div>
     </AppShell>
   );

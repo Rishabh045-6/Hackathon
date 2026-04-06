@@ -1,8 +1,37 @@
+export type ExplanationSeverity = "low" | "medium" | "high";
+
 export type ClassifierExplanation = {
   summary: string;
   likelyCause: string;
-  severity: "low" | "medium" | "high";
+  severity: ExplanationSeverity;
   recommendedAction: string;
+};
+
+export type OperationalExplanation = {
+  summary: string;
+  what_is_happening: string;
+  likely_cause: string;
+  severity_reason: string;
+  recommended_action: string;
+  operator_note: string;
+  severity: ExplanationSeverity;
+  source: "llm" | "fallback";
+  fallback_reason?: string;
+};
+
+export type ExplanationRequestPayload = {
+  predicted_label: number;
+  predicted_class: string;
+  confidence: number;
+  top_k: Array<{
+    predicted_class: string;
+    predicted_label: number;
+    confidence: number;
+  }>;
+  severity: ExplanationSeverity;
+  source_class?: string | null;
+  source_row?: number | null;
+  is_correct?: boolean | null;
 };
 
 const EXPLANATIONS: Record<number, ClassifierExplanation> = {
@@ -119,4 +148,47 @@ export function getClassifierExplanation(predictedLabel: number): ClassifierExpl
       recommendedAction: "Review the waveform, the top predictions, and recent system events before taking action.",
     }
   );
+}
+
+export function buildFallbackOperationalExplanation(
+  payload: ExplanationRequestPayload,
+  fallbackReason?: string,
+): OperationalExplanation {
+  const local = getClassifierExplanation(payload.predicted_label);
+  const topAlternative = payload.top_k.find(
+    (item) => item.predicted_label !== payload.predicted_label,
+  );
+  const confidencePercent = (payload.confidence * 100).toFixed(2);
+  const correctnessNote =
+    payload.is_correct === null || payload.is_correct === undefined
+      ? "Ground-truth validation is not available for this run."
+      : payload.is_correct
+        ? "This prediction matches the source waveform class for the current simulation run."
+        : "This prediction does not match the source waveform class for the current simulation run.";
+
+  const isNormal = payload.predicted_label === 0;
+
+  return {
+    summary: isNormal
+      ? `System looks normal right now at ${confidencePercent}% confidence.`
+      : `${payload.predicted_class} detected at ${confidencePercent}% confidence.`,
+    what_is_happening: isNormal
+      ? "The current waveform appears nominal, stable, and close to a healthy sinusoidal operating condition."
+      : local.summary,
+    likely_cause: isNormal
+      ? "No meaningful disturbance pattern is present in the current signal window."
+      : local.likelyCause,
+    severity_reason: isNormal
+      ? "This run is treated as low severity because the classifier indicates a normal operating condition."
+      : `This run is treated as ${payload.severity} severity based on the classified disturbance type and confidence profile.`,
+    recommended_action: isNormal
+      ? "No immediate action is required. Continue monitoring and keep this waveform as a normal operating reference."
+      : local.recommendedAction,
+    operator_note: topAlternative
+      ? `${correctnessNote} The nearest alternative was ${topAlternative.predicted_class} at ${(topAlternative.confidence * 100).toFixed(2)}% confidence.`
+      : correctnessNote,
+    severity: payload.severity,
+    source: "fallback",
+    fallback_reason: fallbackReason,
+  };
 }
