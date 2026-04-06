@@ -261,6 +261,10 @@ export function WaveformClassifierCard() {
       averageConfidence: Number((averageConfidence * 100).toFixed(2)),
     };
   }, [history]);
+  const recentTimelineEntries = useMemo(
+    () => history.slice(-5).reverse(),
+    [history],
+  );
   const liveElapsedMs = liveStreamState
     ? Math.max(0, streamNowMs - new Date(liveStreamState.started_at).getTime())
     : 0;
@@ -1108,11 +1112,11 @@ export function WaveformClassifierCard() {
 
           <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
             <p className="text-sm font-medium text-white">Recent Predictions Timeline</p>
-            {history.length === 0 ? (
+            {recentTimelineEntries.length === 0 ? (
               <p className="mt-3 text-sm text-slate-400">Recent simulated predictions will appear here.</p>
             ) : (
               <div className="mt-3 space-y-3">
-                {[...history].reverse().slice(0, 5).map((entry) => {
+                {recentTimelineEntries.map((entry) => {
                   const isExpanded = expandedRuns.includes(entry.run);
                   const entryWaveform = entry.signal.map((value, index) => ({
                     sample: index,
