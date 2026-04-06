@@ -185,6 +185,10 @@ export function WaveformClassifierCard() {
   const [manualModeOpen, setManualModeOpen] = usePersistentState("gridsense:waveform:manualModeOpen", false);
   const [explanation, setExplanation] = usePersistentState<OperationalExplanation | null>("gridsense:waveform:explanation", null);
   const [playbackIndex, setPlaybackIndex] = usePersistentState("gridsense:waveform:playbackIndex", 0);
+  const [highSeverityPopup, setHighSeverityPopup] = useState<{
+    title: string;
+    message: string;
+  } | null>(null);
   const [streamNowMs, setStreamNowMs] = useState(() => Date.now());
   const lastExplanationMetaRef = useRef<{
     key: string;
@@ -222,15 +226,6 @@ export function WaveformClassifierCard() {
       return points;
     });
   }, [history]);
-
-  const topProbabilityData = useMemo(
-    () =>
-      (result?.top_k ?? []).map((item) => ({
-        className: item.predicted_class,
-        confidence: Number((item.confidence * 100).toFixed(2)),
-      })),
-    [result],
-  );
 
   const confidenceTimeline = useMemo(
     () =>
@@ -320,6 +315,13 @@ export function WaveformClassifierCard() {
       powerFactor: clamp(powerFactor, 0.7, 1),
     };
   }, [currentSampleValue, liveMetrics]);
+
+  function showHighSeverityPopup(message: string) {
+    setHighSeverityPopup({
+      title: "High severity risk detected",
+      message,
+    });
+  }
 
   useEffect(() => {
     async function loadDatasetMeta() {
@@ -641,6 +643,10 @@ export function WaveformClassifierCard() {
       setResult(resultData);
       setConfidenceGateMessage(null);
 
+      if (nextExplanation.severity === "high") {
+        showHighSeverityPopup(nextExplanation.summary);
+      }
+
       if (
         lastExplanationMeta &&
         lastExplanationMeta.key === explanationKey &&
@@ -718,6 +724,10 @@ export function WaveformClassifierCard() {
     }
   }
 
+  function dismissHighSeverityPopup() {
+    setHighSeverityPopup(null);
+  }
+
   async function loadWaveform({
     className,
     sampleIndex,
@@ -757,10 +767,38 @@ export function WaveformClassifierCard() {
   const latestHistoryEntry = history[history.length - 1] ?? null;
 
   return (
-    <PanelCard
-      title="Waveform Classifier"
-      subtitle="Run live disturbance simulation from the 17-class waveform dataset and inspect classifier behavior in real time."
-    >
+    <>
+      {highSeverityPopup ? (
+        <div className="fixed bottom-6 right-6 z-50 w-[min(92vw,28rem)] rounded-3xl border border-rose-400/20 bg-slate-950/95 p-4 shadow-2xl shadow-rose-950/30 backdrop-blur">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-sm font-semibold text-rose-200">{highSeverityPopup.title}</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">{highSeverityPopup.message}</p>
+            </div>
+            <button
+              type="button"
+              onClick={dismissHighSeverityPopup}
+              className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-medium text-slate-300 transition hover:bg-white/10"
+            >
+              Dismiss
+            </button>
+          </div>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <Link
+              href="/logs#prediction-history"
+              className="rounded-full bg-rose-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-rose-300"
+              onClick={dismissHighSeverityPopup}
+            >
+              Open logs
+            </Link>
+          </div>
+        </div>
+      ) : null}
+
+      <PanelCard
+        title="Waveform Classifier"
+        subtitle="Run live disturbance simulation from the 17-class waveform dataset and inspect classifier behavior in real time."
+      >
       <div className="grid gap-6 xl:grid-cols-2">
         <div className="space-y-4">
           <div className="rounded-2xl border border-white/10 bg-slate-950/70 p-4">
@@ -992,7 +1030,7 @@ export function WaveformClassifierCard() {
             {!result ? (
               <p className="mt-3 text-sm text-slate-400">
                 {confidenceGateMessage ??
-                  "Start the waveform simulation to see the predicted disturbance class, confidence, and top matches."}
+                  "Start the waveform simulation to see the predicted disturbance class and confidence."}
               </p>
             ) : (
               <div className="mt-4 space-y-4">
@@ -1135,10 +1173,6 @@ export function WaveformClassifierCard() {
                     sample: index,
                     amplitude: Number(value.toFixed(6)),
                   }));
-                  const entryTopK = entry.topK.map((item) => ({
-                    className: item.predicted_class,
-                    confidence: Number((item.confidence * 100).toFixed(2)),
-                  }));
 
                   return (
                     <div
@@ -1207,34 +1241,6 @@ export function WaveformClassifierCard() {
                                     xKey="sample"
                                     series={[{ dataKey: "amplitude", name: "Amplitude", color: "#22d3ee" }]}
                                   />
-                                </div>
-                              </div>
-
-                              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-                                <p className="text-sm font-medium text-white">Top 3 Predictions</p>
-                                <div className="mt-3">
-                                  <BarChartCard
-                                    data={entryTopK}
-                                    xKey="className"
-                                    yKey="confidence"
-                                    color="#f59e0b"
-                                  />
-                                </div>
-                                <div className="mt-3 space-y-3">
-                                  {entry.topK.map((item, index) => (
-                                    <div
-                                      key={`${entry.run}-${item.predicted_label}-${index}`}
-                                      className="flex items-center justify-between rounded-2xl bg-slate-900/80 px-3 py-3"
-                                    >
-                                      <div>
-                                        <p className="text-sm font-medium text-white">{item.predicted_class}</p>
-                                        <p className="text-xs text-slate-400">Class ID {item.predicted_label}</p>
-                                      </div>
-                                      <p className="text-sm font-semibold text-slate-100">
-                                        {(item.confidence * 100).toFixed(2)}%
-                                      </p>
-                                    </div>
-                                  ))}
                                 </div>
                               </div>
                             </div>
@@ -1316,6 +1322,7 @@ export function WaveformClassifierCard() {
           </div>
         </div>
       </div>
-    </PanelCard>
+      </PanelCard>
+    </>
   );
 }

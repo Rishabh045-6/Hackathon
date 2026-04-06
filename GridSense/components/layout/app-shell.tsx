@@ -9,7 +9,6 @@ const navItems = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/analytics", label: "Analytics" },
   { href: "/logs", label: "Logs" },
-  { href: "/alerts", label: "Alerts" },
 ];
 
 export function AppShell({

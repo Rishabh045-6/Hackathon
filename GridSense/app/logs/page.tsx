@@ -49,7 +49,7 @@ export default async function LogsPage() {
         />
       </div>
 
-      <div className="mt-6">
+      <div id="prediction-history" className="mt-6">
         <PanelCard title="Prediction History" subtitle="Newest predictions first, with source class context from the waveform simulation when available.">
           <PredictionLogExplorer logs={logs} />
         </PanelCard>
