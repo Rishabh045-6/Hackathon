@@ -12,6 +12,7 @@ import {
   type ExplanationRequestPayload,
   type OperationalExplanation,
 } from "@/lib/classifier-explanations";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import type { LiveStreamState } from "@/types/grid";
 
 type ClassifierResponse = {
@@ -163,23 +164,26 @@ function parseSignalInput(raw: string): number[] {
 }
 
 export function WaveformClassifierCard() {
-  const [inputValue, setInputValue] = useState("");
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
-  const [signal, setSignal] = useState<number[] | null>(null);
-  const [result, setResult] = useState<ClassifierResponse | null>(null);
+  const [inputValue, setInputValue] = usePersistentState("gridsense:waveform:inputValue", "");
+  const [selectedFile, setSelectedFile] = usePersistentState<string | null>("gridsense:waveform:selectedFile", null);
+  const [signal, setSignal] = usePersistentState<number[] | null>("gridsense:waveform:signal", null);
+  const [result, setResult] = usePersistentState<ClassifierResponse | null>("gridsense:waveform:result", null);
   const [datasetMeta, setDatasetMeta] = useState<DatasetMeta | null>(null);
   const [liveStreamState, setLiveStreamState] = useState<LiveStreamState | null>(null);
   const [simulationInfo, setSimulationInfo] = useState<WaveformSample | null>(null);
-  const [history, setHistory] = useState<SimulationHistoryEntry[]>([]);
-  const [expandedRuns, setExpandedRuns] = useState<number[]>([]);
+  const [history, setHistory] = usePersistentState<SimulationHistoryEntry[]>("gridsense:waveform:history", []);
+  const [expandedRuns, setExpandedRuns] = usePersistentState<number[]>("gridsense:waveform:expandedRuns", []);
   const [liveSourceClass, setLiveSourceClass] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [confidenceGateMessage, setConfidenceGateMessage] = useState<string | null>(null);
+  const [confidenceGateMessage, setConfidenceGateMessage] = usePersistentState<string | null>(
+    "gridsense:waveform:confidenceGateMessage",
+    null,
+  );
   const [loading, setLoading] = useState(false);
   const [explanationLoading, setExplanationLoading] = useState(false);
-  const [manualModeOpen, setManualModeOpen] = useState(false);
-  const [explanation, setExplanation] = useState<OperationalExplanation | null>(null);
-  const [playbackIndex, setPlaybackIndex] = useState(0);
+  const [manualModeOpen, setManualModeOpen] = usePersistentState("gridsense:waveform:manualModeOpen", false);
+  const [explanation, setExplanation] = usePersistentState<OperationalExplanation | null>("gridsense:waveform:explanation", null);
+  const [playbackIndex, setPlaybackIndex] = usePersistentState("gridsense:waveform:playbackIndex", 0);
   const [streamNowMs, setStreamNowMs] = useState(() => Date.now());
   const lastExplanationMetaRef = useRef<{
     key: string;

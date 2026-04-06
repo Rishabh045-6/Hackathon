@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { LineChartCard } from "@/components/charts/line-chart-card";
 import { KpiCard } from "@/components/dashboard/kpi-card";
 import { PanelCard } from "@/components/dashboard/panel-card";
@@ -12,6 +12,7 @@ import {
   stepReading,
 } from "@/lib/live-sim";
 import { getClassifierExplanation } from "@/lib/classifier-explanations";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import type { Alert, Anomaly, GridReading, PredictionLog } from "@/types/grid";
 
 type ApiResponse<T> = {
@@ -64,9 +65,11 @@ function getAnomalyLabel(anomaly: Anomaly) {
   return anomaly.anomaly_type.replace(/_/g, " ");
 }
 export default function DashboardPage() {
-  const [readings, setReadings] = useState<GridReading[]>(() => createInitialReadings(24, "dashboard"));
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [anomalies, setAnomalies] = useState<Anomaly[]>([]);
+  const [readings, setReadings] = usePersistentState<GridReading[]>("gridsense:dashboard:readings", () =>
+    createInitialReadings(24, "dashboard"),
+  );
+  const [alerts, setAlerts] = usePersistentState<Alert[]>("gridsense:dashboard:alerts", []);
+  const [anomalies, setAnomalies] = usePersistentState<Anomaly[]>("gridsense:dashboard:anomalies", []);
 
   useEffect(() => {
     if (readings.length === 0) {

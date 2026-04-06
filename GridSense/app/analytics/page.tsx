@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import { WaveformClassifierCard } from "@/components/analytics/waveform-classifier-card";
 import { LineChartCard } from "@/components/charts/line-chart-card";
 import { PanelCard } from "@/components/dashboard/panel-card";
@@ -16,17 +16,20 @@ import {
   createInitialReadings,
   stepReading,
 } from "@/lib/live-sim";
+import { usePersistentState } from "@/lib/use-persistent-state";
 import type { Alert, Anomaly, GridReading, Prediction } from "@/types/grid";
 
 export default function AnalyticsPage() {
-  const [readings, setReadings] = useState<GridReading[]>(() => createInitialReadings(24, "analytics"));
-  const [predictions, setPredictions] = useState<Prediction[]>(() =>
+  const [readings, setReadings] = usePersistentState<GridReading[]>("gridsense:analytics:readings", () =>
+    createInitialReadings(24, "analytics"),
+  );
+  const [predictions, setPredictions] = usePersistentState<Prediction[]>("gridsense:analytics:predictions", () =>
     createInitialPredictions(createInitialReadings(12, "analytics-predictions"), 12, "analytics"),
   );
-  const [anomalies, setAnomalies] = useState<Anomaly[]>(() =>
+  const [anomalies, setAnomalies] = usePersistentState<Anomaly[]>("gridsense:analytics:anomalies", () =>
     createInitialAnomalies(createInitialReadings(24, "analytics-anomalies"), 24, "analytics"),
   );
-  const [alerts, setAlerts] = useState<Alert[]>(() =>
+  const [alerts, setAlerts] = usePersistentState<Alert[]>("gridsense:analytics:alerts", () =>
     createInitialAlerts(createInitialReadings(24, "analytics-alerts"), 24, "live-simulator")
       .filter((alert) => alert.priority === "high")
       .slice(-3),
