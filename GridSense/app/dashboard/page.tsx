@@ -8,23 +8,47 @@ import { SeverityBadge, StatusBadge } from "@/components/dashboard/status-badge"
 import { AppShell } from "@/components/layout/app-shell";
 import { StatePanel } from "@/components/layout/state-panel";
 import {
-  createAlert,
   createAnomaliesFromReading,
+  createCriticalAlertFromReading,
   createInitialAlerts,
   createInitialAnomalies,
   createInitialReadings,
-  getAlertPriorityFromReading,
   stepReading,
 } from "@/lib/live-sim";
 import type { Alert, Anomaly, GridReading } from "@/types/grid";
 
+const REPEAT_COOLDOWN_MS = 12_000;
+
+function isRecent(timestamp: string) {
+  return Date.now() - new Date(timestamp).getTime() < REPEAT_COOLDOWN_MS;
+}
+
+function getAnomalyLabel(anomaly: Anomaly) {
+  if (anomaly.anomaly_type === "high_load") {
+    return "High Load";
+  }
+
+  if (anomaly.anomaly_type === "voltage_sag") {
+    return "Voltage Sag";
+  }
+
+  if (anomaly.anomaly_type === "voltage_swell") {
+    return "Voltage Swell";
+  }
+
+  return anomaly.metric.replace(/_/g, " ");
+}
 export default function DashboardPage() {
   const [readings, setReadings] = useState<GridReading[]>(() => createInitialReadings(24, "dashboard"));
   const [alerts, setAlerts] = useState<Alert[]>(() =>
-    createInitialAlerts(createInitialReadings(12, "dashboard-alerts"), 5, "live-dashboard-simulator", "dashboard event"),
+    createInitialAlerts(createInitialReadings(12, "dashboard-alerts"), 12, "live-dashboard-simulator", "dashboard event")
+      .filter((alert) => alert.priority === "high")
+      .slice(0, 3),
   );
   const [anomalies, setAnomalies] = useState<Anomaly[]>(() =>
-    createInitialAnomalies(createInitialReadings(12, "dashboard-anomalies"), 6, "dashboard"),
+    createInitialAnomalies(createInitialReadings(12, "dashboard-anomalies"), 12, "dashboard")
+      .filter((anomaly) => anomaly.severity === "high")
+      .slice(0, 3),
   );
 
   useEffect(() => {
@@ -41,18 +65,35 @@ export default function DashboardPage() {
         const nextReading = stepReading(base, "dashboard");
 
         setAnomalies((currentAnomalies) => {
-          const nextItems = [...createAnomaliesFromReading(nextReading, "dashboard"), ...currentAnomalies];
-          return nextItems.slice(0, 6);
+          const nextHighAnomalies = createAnomaliesFromReading(nextReading, "dashboard").filter(
+            (anomaly) => anomaly.severity === "high",
+          );
+
+          const dedupedNewItems = nextHighAnomalies.filter((anomaly) => {
+            const existing = currentAnomalies.find(
+              (current) => current.anomaly_type === anomaly.anomaly_type && isRecent(current.detected_at),
+            );
+            return !existing;
+          });
+
+          return [...dedupedNewItems, ...currentAnomalies].slice(0, 3);
         });
 
         setAlerts((currentAlerts) => {
-          const priority = getAlertPriorityFromReading(nextReading);
-          if (!priority) {
+          const nextAlert = createCriticalAlertFromReading(nextReading, "live-dashboard-simulator");
+          if (!nextAlert) {
             return currentAlerts;
           }
 
-          const nextAlert = createAlert(priority, "live-dashboard-simulator", "dashboard event");
-          return [nextAlert, ...currentAlerts].slice(0, 5);
+          const duplicateRecentAlert = currentAlerts.find(
+            (alert) => alert.title === nextAlert.title && isRecent(alert.created_at),
+          );
+
+          if (duplicateRecentAlert) {
+            return currentAlerts;
+          }
+
+          return [nextAlert, ...currentAlerts].slice(0, 3);
         });
 
         return [...current.slice(-23), nextReading];
@@ -65,9 +106,7 @@ export default function DashboardPage() {
   const latest = readings[readings.length - 1];
   const chartData = useMemo(
     () =>
-      [...readings]
-        .reverse()
-        .map((reading) => ({
+      readings.map((reading) => ({
           time: new Date(reading.recorded_at).toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",
@@ -111,15 +150,15 @@ export default function DashboardPage() {
           />
         </PanelCard>
 
-        <PanelCard title="Anomaly Summary" subtitle="Current rule-based detections">
+        <PanelCard title="Anomaly Summary" subtitle="Only fresh high-severity operating problems are shown here. Repeated readings of the same issue are suppressed for a short cooldown.">
           <div className="space-y-3">
             {anomalies.length === 0 ? (
-              <p className="text-sm text-slate-400">No anomalies detected in the current window.</p>
+              <p className="text-sm text-slate-400">No high-severity anomaly right now.</p>
             ) : (
-              anomalies.slice(0, 4).map((anomaly) => (
+              anomalies.slice(0, 3).map((anomaly) => (
                 <div key={anomaly.id} className="rounded-2xl bg-white/5 p-4">
                   <div className="flex items-center justify-between gap-3">
-                    <p className="font-medium text-white">{anomaly.metric}</p>
+                    <p className="font-medium text-white">{getAnomalyLabel(anomaly)}</p>
                     <SeverityBadge value={anomaly.severity} />
                   </div>
                   <p className="mt-2 text-sm text-slate-400">{anomaly.description}</p>
@@ -145,12 +184,12 @@ export default function DashboardPage() {
           />
         </PanelCard>
 
-        <PanelCard title="Recent Alerts" subtitle="Latest generated system alerts">
+        <PanelCard title="Recent Alerts" subtitle="Only active high-priority alerts are shown. If nothing critical is happening, this stays empty.">
             <div className="space-y-3">
               {alerts.length === 0 ? (
-                <p className="text-sm text-slate-400">No active alerts available.</p>
+                <p className="text-sm text-slate-400">No critical alert right now.</p>
               ) : (
-                alerts.slice(0, 5).map((alert) => (
+                alerts.slice(0, 3).map((alert) => (
                   <div key={alert.id} className="rounded-2xl bg-white/5 p-4">
                   <div className="flex items-center justify-between gap-3">
                     <p className="font-medium text-white">{alert.title}</p>

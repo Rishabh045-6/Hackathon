@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { NextResponse } from "next/server";
 import {
   buildFallbackOperationalExplanation,
@@ -7,13 +9,29 @@ import {
 
 export const runtime = "nodejs";
 
-const OPENAI_API_URL = "https://api.openai.com/v1/responses";
-const DEFAULT_MODEL = "gpt-4.1-mini";
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+const DEFAULT_MODEL = "llama-3.3-70b-versatile";
 const CACHE_TTL_MS = 10 * 60 * 1000;
-const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000;
+const MAX_RETRIES = 2;
+const BASE_BACKOFF_MS = 1500;
+const MAX_BACKOFF_MS = 20_000;
+const RATE_LIMIT_BACKOFF_MS = 10 * 60 * 1000;
+const MAX_OUTPUT_TOKENS = 220;
+
+type GroqErrorPayload = {
+  error?: {
+    message?: string;
+    type?: string;
+    param?: string | null;
+    code?: string | null;
+  };
+};
 
 const explanationCache = new Map<string, { expiresAt: number; data: OperationalExplanation }>();
-let openAiCooldownUntil = 0;
+let providerBackoffUntil = 0;
+
+const systemPrompt =
+  "You are GridSense AI, an industrial power quality assistant. Explain electrical disturbances clearly for plant operators. Return valid JSON only with exactly these keys: summary, what_is_happening, likely_cause, severity_reason, recommended_action, operator_note. Do not include markdown fences or extra text. Be concise and practical.";
 
 const explanationSchema = {
   name: "grid_disturbance_explanation",
@@ -55,21 +73,31 @@ function isValidPayload(body: unknown): body is ExplanationRequestPayload {
   );
 }
 
+function getCacheKey(payload: ExplanationRequestPayload) {
+  return JSON.stringify({
+    predicted_label: payload.predicted_label,
+    predicted_class: payload.predicted_class,
+    severity: payload.severity,
+    top_k: payload.top_k.map((item) => ({
+      predicted_label: item.predicted_label,
+      confidence: Number(item.confidence.toFixed(3)),
+    })),
+  });
+}
+
+function estimateTokens(value: string) {
+  return Math.ceil(value.length / 4);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function extractResponseText(data: any): string | null {
-  if (typeof data?.output_text === "string" && data.output_text.trim()) {
-    return data.output_text;
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content === "string" && content.trim()) {
+    return content;
   }
-
-  const output = Array.isArray(data?.output) ? data.output : [];
-  for (const item of output) {
-    const content = Array.isArray(item?.content) ? item.content : [];
-    for (const part of content) {
-      if (typeof part?.text === "string" && part.text.trim()) {
-        return part.text;
-      }
-    }
-  }
-
   return null;
 }
 
@@ -102,89 +130,197 @@ function normalizeExplanation(
   };
 }
 
-function getCacheKey(payload: ExplanationRequestPayload) {
-  return JSON.stringify({
-    predicted_label: payload.predicted_label,
-    predicted_class: payload.predicted_class,
-    severity: payload.severity,
-    top_k: payload.top_k.map((item) => ({
-      predicted_label: item.predicted_label,
-      confidence: Number(item.confidence.toFixed(3)),
-    })),
-  });
+function getRetryDelayMs(attempt: number, retryAfterHeader: string | null) {
+  const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : NaN;
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.min(retryAfterSeconds * 1000, MAX_BACKOFF_MS);
+  }
+
+  const exponential = Math.min(BASE_BACKOFF_MS * 2 ** attempt, MAX_BACKOFF_MS);
+  const jitter = Math.floor(Math.random() * 500);
+  return exponential + jitter;
+}
+
+function logDiagnostics(data: {
+  timestamp: string;
+  model: string;
+  estimatedInputTokens: number;
+  estimatedOutputTokens: number;
+  retryCount: number;
+  queued: boolean;
+  parallel: boolean;
+  status?: number;
+  errorType?: string | null;
+  errorCode?: string | null;
+}) {
+  console.info("[grid-explain]", JSON.stringify(data));
+}
+
+function readLocalEnvValue(key: string) {
+  try {
+    const envPath = path.join(process.cwd(), ".env");
+    const contents = readFileSync(envPath, "utf8");
+    const line = contents
+      .split(/\r?\n/)
+      .find((entry) => entry.startsWith(`${key}=`));
+    if (!line) {
+      return undefined;
+    }
+
+    return line.slice(key.length + 1).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function getConfiguredGroqSettings() {
+  return {
+    apiKey: readLocalEnvValue("GROQ_API_KEY") || process.env.GROQ_API_KEY?.trim(),
+    model: readLocalEnvValue("GROQ_MODEL") || process.env.GROQ_MODEL?.trim() || DEFAULT_MODEL,
+  };
 }
 
 async function generateLlmExplanation(
   payload: ExplanationRequestPayload,
-): Promise<OperationalExplanation | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
+): Promise<{ explanation: OperationalExplanation | null; errorMessage?: string }> {
+  const { apiKey, model } = getConfiguredGroqSettings();
   if (!apiKey) {
-    return null;
+    return { explanation: null, errorMessage: "GROQ_API_KEY is missing." };
   }
 
-  if (Date.now() < openAiCooldownUntil) {
-    throw new Error("OpenAI cooldown active after a rate-limit response.");
+  if (Date.now() < providerBackoffUntil) {
+    return { explanation: null, errorMessage: "Groq backoff is active after rate limiting." };
   }
 
-  const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4000);
-  const response = await fetch(OPENAI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    signal: controller.signal,
-    body: JSON.stringify({
-      model,
-      input: [
-        {
-          role: "system",
-          content: [
-            {
-              type: "input_text",
-              text:
-                "You explain power-quality classifier results for grid operators. The classifier output is the source of truth. Do not change or question the predicted class. Keep the explanation concise, operational, and specific. Do not invent values that are not provided. If the predicted label indicates a normal or nominal operating condition, explicitly say the system looks normal right now and that no immediate action is required beyond monitoring.",
-            },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: JSON.stringify(payload),
-            },
-          ],
-        },
-      ],
-      temperature: 0.2,
-      text: {
-        format: {
-          type: "json_schema",
-          ...explanationSchema,
-        },
-      },
-    }),
-  });
-  clearTimeout(timeout);
+  const requestText = JSON.stringify(payload);
+  const estimatedInputTokens = estimateTokens(systemPrompt) + estimateTokens(requestText);
 
-  if (!response.ok) {
-    if (response.status === 429) {
-      openAiCooldownUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      logDiagnostics({
+        timestamp: new Date().toISOString(),
+        model,
+        estimatedInputTokens,
+        estimatedOutputTokens: MAX_OUTPUT_TOKENS,
+        retryCount: attempt,
+        queued: attempt > 0,
+        parallel: false,
+      });
+
+      const response = await fetch(GROQ_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages: [
+            {
+              role: "system",
+              content: systemPrompt,
+            },
+            {
+              role: "user",
+              content: `Explain this event:\n${requestText}`,
+            },
+          ],
+          max_tokens: MAX_OUTPUT_TOKENS,
+          temperature: 0.2,
+        }),
+      });
+
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const responseText = await response.text();
+        let errorPayload: GroqErrorPayload | undefined;
+        try {
+          errorPayload = responseText ? (JSON.parse(responseText) as GroqErrorPayload) : undefined;
+        } catch {
+          errorPayload = undefined;
+        }
+        const errorType = errorPayload?.error?.type ?? null;
+        const errorCode = errorPayload?.error?.code ?? null;
+        const errorMessage =
+          errorPayload?.error?.message ??
+          `Groq explanation request failed with status ${response.status}.`;
+
+        logDiagnostics({
+          timestamp: new Date().toISOString(),
+          model,
+          estimatedInputTokens,
+          estimatedOutputTokens: MAX_OUTPUT_TOKENS,
+          retryCount: attempt,
+          queued: attempt > 0,
+          parallel: false,
+          status: response.status,
+          errorType,
+          errorCode,
+        });
+
+        if (response.status === 429) {
+          if (attempt < MAX_RETRIES) {
+            const delay = getRetryDelayMs(attempt, response.headers.get("retry-after"));
+            await sleep(delay);
+            continue;
+          }
+
+          providerBackoffUntil = Date.now() + RATE_LIMIT_BACKOFF_MS;
+        }
+
+        return { explanation: null, errorMessage };
+      }
+
+      const data = await response.json();
+      const rawText = extractResponseText(data);
+      if (!rawText) {
+        return { explanation: null, errorMessage: "Groq response was empty." };
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(rawText) as Record<string, unknown>;
+      } catch (error) {
+        return { explanation: null, errorMessage: "Groq returned non-JSON content." };
+      }
+      const explanation = normalizeExplanation(parsed, payload);
+      if (!explanation) {
+        return { explanation: null, errorMessage: "Groq JSON response did not match the expected explanation shape." };
+      }
+
+      return { explanation };
+    } catch (error) {
+      clearTimeout(timeout);
+      const message = error instanceof Error ? error.message : "Groq request failed.";
+
+      logDiagnostics({
+        timestamp: new Date().toISOString(),
+        model,
+        estimatedInputTokens,
+        estimatedOutputTokens: MAX_OUTPUT_TOKENS,
+        retryCount: attempt,
+        queued: attempt > 0,
+        parallel: false,
+        errorType: "request_error",
+        errorCode: null,
+      });
+
+      if (attempt < MAX_RETRIES) {
+        const delay = getRetryDelayMs(attempt, null);
+        await sleep(delay);
+        continue;
+      }
+
+      return { explanation: null, errorMessage: message };
     }
-    throw new Error(`OpenAI explanation request failed with status ${response.status}.`);
   }
 
-  const data = await response.json();
-  const rawText = extractResponseText(data);
-  if (!rawText) {
-    return null;
-  }
-
-  const parsed = JSON.parse(rawText) as Record<string, unknown>;
-  return normalizeExplanation(parsed, payload);
+  return { explanation: null, errorMessage: "Groq explanation retries were exhausted." };
 }
 
 export async function POST(request: Request) {
@@ -201,7 +337,6 @@ export async function POST(request: Request) {
       );
     }
 
-    let fallbackReason: string | undefined;
     const cacheKey = getCacheKey(body);
     const cached = explanationCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
@@ -212,28 +347,24 @@ export async function POST(request: Request) {
       });
     }
 
-    try {
-      const llmExplanation = await generateLlmExplanation(body);
-      if (llmExplanation) {
-        explanationCache.set(cacheKey, {
-          expiresAt: Date.now() + CACHE_TTL_MS,
-          data: llmExplanation,
-        });
-        return NextResponse.json({
-          ok: true,
-          data: llmExplanation,
-          error: null,
-        });
-      }
-      fallbackReason = "LLM response was empty or invalid.";
-    } catch (error) {
-      fallbackReason = error instanceof Error ? error.message : "LLM request failed.";
-      // Fall through to the local operational fallback.
+    const { explanation, errorMessage } = await generateLlmExplanation(body);
+    if (explanation) {
+      explanationCache.set(cacheKey, {
+        expiresAt: Date.now() + CACHE_TTL_MS,
+        data: explanation,
+      });
+
+      return NextResponse.json({
+        ok: true,
+        data: explanation,
+        error: null,
+      });
     }
 
+    console.info("[grid-explain] fallback", JSON.stringify({ reason: errorMessage ?? "unknown" }));
     return NextResponse.json({
       ok: true,
-      data: buildFallbackOperationalExplanation(body, fallbackReason),
+      data: buildFallbackOperationalExplanation(body, errorMessage),
       error: null,
     });
   } catch (error) {

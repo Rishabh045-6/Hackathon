@@ -1,3 +1,4 @@
+import { getClassifierExplanation } from "@/lib/classifier-explanations";
 import type { Alert, Anomaly, GridReading, Prediction, Severity } from "@/types/grid";
 
 export function clamp(value: number, min: number, max: number) {
@@ -10,6 +11,10 @@ export function jitter(amount: number) {
 
 function isoAtOffset(offsetMs: number) {
   return new Date(Date.now() + offsetMs).toISOString();
+}
+
+function uniqueSuffix() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function createInitialReading(index: number, total: number, prefix: string): GridReading {
@@ -81,7 +86,7 @@ export function createAnomaliesFromReading(reading: GridReading, prefix: string)
 
   if (reading.voltage > 244 || reading.voltage < 218) {
     items.push({
-      id: `${prefix}-anomaly-voltage-${Date.now()}`,
+      id: `${prefix}-anomaly-voltage-${uniqueSuffix()}`,
       user_id: "simulated-user",
       reading_id: reading.id,
       anomaly_type: reading.voltage > 244 ? "voltage_swell" : "voltage_sag",
@@ -98,7 +103,7 @@ export function createAnomaliesFromReading(reading: GridReading, prefix: string)
 
   if (reading.load > 95) {
     items.push({
-      id: `${prefix}-anomaly-load-${Date.now()}`,
+      id: `${prefix}-anomaly-load-${uniqueSuffix()}`,
       user_id: "simulated-user",
       reading_id: reading.id,
       anomaly_type: "high_load",
@@ -115,7 +120,7 @@ export function createAnomaliesFromReading(reading: GridReading, prefix: string)
 
   if (Math.random() < 0.12) {
     items.push({
-      id: `${prefix}-anomaly-frequency-${Date.now()}`,
+      id: `${prefix}-anomaly-frequency-${uniqueSuffix()}`,
       user_id: "simulated-user",
       reading_id: reading.id,
       anomaly_type: "frequency_drift",
@@ -142,6 +147,75 @@ export function getAlertPriorityFromReading(reading: GridReading): Severity | nu
   if (reading.load > 95 || reading.voltage < 218 || reading.voltage > 244) return "medium";
   if (Math.random() < 0.2) return "low";
   return null;
+}
+
+export function createCriticalAlertFromReading(reading: GridReading, prefix: string): Alert | null {
+  if (reading.load > 102) {
+    return {
+      id: `${prefix}-high-load-${uniqueSuffix()}`,
+      user_id: "simulated-user",
+      anomaly_id: null,
+      title: "Critical Load Alert",
+      message: `Feeder load is critically high at ${reading.load.toFixed(2)} kW.`,
+      status: "open",
+      priority: "high",
+      triggered_by: prefix,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  if (reading.voltage < 216) {
+    return {
+      id: `${prefix}-voltage-sag-${uniqueSuffix()}`,
+      user_id: "simulated-user",
+      anomaly_id: null,
+      title: "Critical Voltage Sag",
+      message: `Voltage dropped to ${reading.voltage.toFixed(2)} V, below the critical operating band.`,
+      status: "open",
+      priority: "high",
+      triggered_by: prefix,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  if (reading.voltage > 246) {
+    return {
+      id: `${prefix}-voltage-swell-${uniqueSuffix()}`,
+      user_id: "simulated-user",
+      anomaly_id: null,
+      title: "Critical Voltage Swell",
+      message: `Voltage rose to ${reading.voltage.toFixed(2)} V, above the critical operating band.`,
+      status: "open",
+      priority: "high",
+      triggered_by: prefix,
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  return null;
+}
+
+export function createCriticalDisturbanceAlert(
+  predictedLabel: number,
+  predictedClass: string,
+  prefix: string,
+): Alert | null {
+  const explanation = getClassifierExplanation(predictedLabel);
+  if (explanation.severity !== "high") {
+    return null;
+  }
+
+  return {
+    id: `${prefix}-disturbance-${predictedLabel}-${uniqueSuffix()}`,
+    user_id: "simulated-user",
+    anomaly_id: null,
+    title: `Critical Disturbance: ${predictedClass}`,
+    message: `AI classified a high-severity ${predictedClass} disturbance. ${explanation.recommendedAction}`,
+    status: "open",
+    priority: "high",
+    triggered_by: prefix,
+    created_at: new Date().toISOString(),
+  };
 }
 
 export function createAlert(priority: Severity, prefix: string, titlePrefix = "live grid event"): Alert {

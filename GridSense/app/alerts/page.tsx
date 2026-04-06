@@ -4,33 +4,73 @@ import { useEffect, useState } from "react";
 import { PanelCard } from "@/components/dashboard/panel-card";
 import { SeverityBadge, StatusBadge } from "@/components/dashboard/status-badge";
 import { AppShell } from "@/components/layout/app-shell";
-import { createAlert } from "@/lib/live-sim";
-import type { Alert, AlertStatus } from "@/types/grid";
+import {
+  createCriticalAlertFromReading,
+  createCriticalDisturbanceAlert,
+  createInitialReadings,
+  stepReading,
+} from "@/lib/live-sim";
+import type { Alert, AlertStatus, GridReading } from "@/types/grid";
 
 const statusOptions: AlertStatus[] = ["open", "acknowledged", "resolved"];
+const REPEAT_COOLDOWN_MS = 12_000;
+const DISTURBANCE_ALERT_CLASSES = [
+  { predictedLabel: 3, predictedClass: "Interruption" },
+  { predictedLabel: 4, predictedClass: "Transient" },
+  { predictedLabel: 7, predictedClass: "Flicker_with_Sag" },
+  { predictedLabel: 8, predictedClass: "Flicker_with_Swell" },
+  { predictedLabel: 12, predictedClass: "Sag_with_Oscillatory_Transient" },
+  { predictedLabel: 13, predictedClass: "Swell_with_Oscillatory_Transient" },
+  { predictedLabel: 14, predictedClass: "Sag_with_Harmonics" },
+  { predictedLabel: 15, predictedClass: "Swell_with_Harmonics" },
+];
 
-function randomPriority(): Alert["priority"] {
-  const roll = Math.random();
-  if (roll > 0.82) return "high";
-  if (roll > 0.45) return "medium";
-  return "low";
+function isRecent(timestamp: string) {
+  return Date.now() - new Date(timestamp).getTime() < REPEAT_COOLDOWN_MS;
 }
 
 export default function AlertsPage() {
-  const [alerts, setAlerts] = useState<Alert[]>(() =>
-    Array.from({ length: 8 }, (_, index) =>
-      createAlert(randomPriority(), "live-alerts-simulator", `alert stream ${index + 1}`),
-    ),
-  );
+  const [latestReading, setLatestReading] = useState<GridReading>(() => createInitialReadings(1, "alerts")[0]);
+  const [alerts, setAlerts] = useState<Alert[]>([]);
   const [updatingId, setUpdatingId] = useState<string | null>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      setAlerts((current) => {
-        const priority = randomPriority();
-        const nextAlert = createAlert(priority, "live-alerts-simulator", "alert stream event");
+      setLatestReading((currentReading) => {
+        const nextReading = stepReading(currentReading, "alerts");
 
-        return [nextAlert, ...current].slice(0, 5);
+        setAlerts((currentAlerts) => {
+          const readingAlert = createCriticalAlertFromReading(nextReading, "live-alerts-simulator");
+          const disturbanceSeed =
+            Math.random() < 0.35
+              ? DISTURBANCE_ALERT_CLASSES[
+                  Math.floor(Math.random() * DISTURBANCE_ALERT_CLASSES.length)
+                ]
+              : null;
+          const disturbanceAlert = disturbanceSeed
+            ? createCriticalDisturbanceAlert(
+                disturbanceSeed.predictedLabel,
+                disturbanceSeed.predictedClass,
+                "waveform-classifier",
+              )
+            : null;
+          const nextAlert = readingAlert ?? disturbanceAlert;
+
+          if (!nextAlert) {
+            return currentAlerts;
+          }
+
+          const duplicateRecentAlert = currentAlerts.find(
+            (alert) => alert.title === nextAlert.title && isRecent(alert.created_at),
+          );
+          if (duplicateRecentAlert) {
+            return currentAlerts;
+          }
+
+          return [nextAlert, ...currentAlerts].slice(0, 3);
+        });
+
+        return nextReading;
       });
     }, 3500);
 
@@ -61,7 +101,7 @@ export default function AlertsPage() {
 
   return (
     <AppShell title="Alerts" subtitle="Operational events and response workflow.">
-      <PanelCard title="Alert Queue" subtitle="Review and update alert status">
+      <PanelCard title="Alert Queue" subtitle="Only critical operating alerts and high-severity AI disturbance alerts appear here. If nothing serious is happening, this stays empty.">
         <div className="overflow-x-auto">
           <table className="min-w-full text-left text-sm">
             <thead className="text-slate-400">
@@ -74,7 +114,7 @@ export default function AlertsPage() {
               </tr>
             </thead>
             <tbody>
-              {alerts.slice(0, 5).map((alert) => (
+              {alerts.slice(0, 3).map((alert) => (
                 <tr key={alert.id} className="border-b border-white/5 align-top">
                   <td className="py-4 pr-4">
                     <p className="font-medium text-white">{alert.title}</p>

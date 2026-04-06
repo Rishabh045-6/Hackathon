@@ -58,6 +58,8 @@ type SimulationHistoryEntry = {
   explanation: OperationalExplanation;
 };
 
+const EXPLANATION_MIN_REQUEST_GAP_MS = 15_000;
+
 function computeSignalMetrics(values: number[]) {
   if (values.length === 0) {
     return { rms: 0, peak: 0, trough: 0, mean: 0 };
@@ -155,6 +157,8 @@ export function WaveformClassifierCard() {
     at: number;
     explanation: OperationalExplanation;
   } | null>(null);
+  const lastExplanationRequestRef = useRef<{ key: string; at: number } | null>(null);
+  const explanationRequestInFlightRef = useRef<string | null>(null);
 
   const severityStyle = useMemo(
     () => getSeverityStyle(result?.predicted_label ?? null),
@@ -373,10 +377,27 @@ export function WaveformClassifierCard() {
 
   async function requestExplanation(
     payload: ExplanationRequestPayload,
+    explanationKey: string,
   ): Promise<OperationalExplanation> {
     const fallback = buildFallbackOperationalExplanation(payload);
+    const now = Date.now();
+    const lastRequest = lastExplanationRequestRef.current;
+
+    if (explanationRequestInFlightRef.current) {
+      return fallback;
+    }
+
+    if (
+      lastRequest &&
+      lastRequest.key === explanationKey &&
+      now - lastRequest.at < EXPLANATION_MIN_REQUEST_GAP_MS
+    ) {
+      return fallback;
+    }
 
     try {
+      explanationRequestInFlightRef.current = explanationKey;
+      lastExplanationRequestRef.current = { key: explanationKey, at: now };
       setExplanationLoading(true);
       const response = await fetch("/api/grid/explain", {
         method: "POST",
@@ -393,6 +414,7 @@ export function WaveformClassifierCard() {
     } catch {
       return fallback;
     } finally {
+      explanationRequestInFlightRef.current = null;
       setExplanationLoading(false);
     }
   }
@@ -511,7 +533,7 @@ export function WaveformClassifierCard() {
           isCorrect,
         );
 
-        void requestExplanation(explanationPayload).then((resolvedExplanation) => {
+        void requestExplanation(explanationPayload, explanationKey).then((resolvedExplanation) => {
           lastExplanationMetaRef.current = {
             key: explanationKey,
             source: resolvedExplanation.source,
@@ -896,7 +918,7 @@ export function WaveformClassifierCard() {
             </div>
             {explanationLoading ? (
               <p className="mt-4 text-sm leading-6 text-slate-300">
-                Generating the next explanation while keeping the current one visible.
+                Currently the status is normal, whenever there is a disturbance, the system will alert you.
               </p>
             ) : !explanation ? (
               <p className="mt-4 text-sm leading-6 text-slate-300">
